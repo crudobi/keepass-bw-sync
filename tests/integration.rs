@@ -13,7 +13,7 @@ use keepass_bw_sync::bw::BwClient;
 use keepass_bw_sync::journal::Journal;
 use keepass_bw_sync::kdbx::{extract_entries, open_vault, save_vault, tombstoned_uuids};
 use keepass_bw_sync::secret::Secret;
-use keepass_bw_sync::sync::{apply, plan, SyncOpts};
+use keepass_bw_sync::sync::{apply, plan, Action, SyncOpts};
 
 struct Stub {
     items: Vec<serde_json::Value>,
@@ -166,7 +166,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     fixture_kdbx(&kdbx);
 
     let (base, state) = spawn_stub();
-    let bw = BwClient::new(&base);
+    let bw = BwClient::new(&base).unwrap();
     bw.sync().unwrap();
 
     let pw = Secret::from_str("test-password");
@@ -183,9 +183,13 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     assert_eq!(p.actions.len(), 2);
     let mut folder_ids = HashMap::new();
     let folders = bw.list_folders().unwrap();
-    let r = apply(&p, &entries, &items, &bw, &mut vault, &journal, &mut folder_ids, &folders, &opts).unwrap();
+    let (r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &mut folder_ids, &folders, &opts).unwrap();
     assert_eq!(r.created, 2);
     assert_eq!(r.quarantined, 0);
+    // Journal ops are deferred: nothing is committed by apply itself.
+    assert_eq!(journal.live_mapping_count().unwrap(), 0);
+    journal.apply_ops(&ops).unwrap();
+    assert_eq!(journal.live_mapping_count().unwrap(), 2);
 
     // Second run: fully idempotent, zero actions.
     let entries = extract_entries(&vault.db);
@@ -203,13 +207,49 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
     assert_eq!(p.actions.len(), 1);
     let mut folder_ids = HashMap::new();
-    let r = apply(&p, &entries, &items, &bw, &mut vault, &journal, &mut folder_ids, &folders, &opts).unwrap();
+    let (r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &mut folder_ids, &folders, &opts).unwrap();
     assert_eq!(r.quarantined, 1);
     assert_eq!(r.updated, 0);
+    journal.apply_ops(&ops).unwrap();
     assert_eq!(journal.list_quarantine().unwrap().len(), 1);
 
-    // Atomic save + reopen: entries intact.
+    // Adopt path: an unstamped Bitwarden item becomes a KeePass entry, and
+    // the KBS_SYNC_ID stamp is written back onto the Bitwarden item.
+    {
+        let mut st = state.lock().unwrap();
+        st.items.push(serde_json::json!({
+            "id": "bw-adopt-1", "name": "adopted", "notes": null, "favorite": false,
+            "folderId": null,
+            "login": {"username": "u", "password": "p", "totp": null, "uris": []},
+            "fields": [],
+            "revisionDate": "2026-10-03T00:00:00Z", "deletedDate": null,
+        }));
+    }
+    let opts = SyncOpts { adopt: true, ..Default::default() };
+    let entries = extract_entries(&vault.db);
+    let items = bw.list_items().unwrap();
+    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
+    assert!(
+        p.actions.iter().any(|a| matches!(a, Action::AdoptBwNew { .. })),
+        "expected an AdoptBwNew action, got {} actions",
+        p.actions.len()
+    );
+    let mut folder_ids = HashMap::new();
+    let (r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &mut folder_ids, &folders, &opts).unwrap();
+    assert_eq!(r.kp_adopted, 1);
+    journal.apply_ops(&ops).unwrap();
+    {
+        let st = state.lock().unwrap();
+        let it = st.items.iter().find(|i| i["id"] == "bw-adopt-1").unwrap();
+        let fields = it["fields"].as_array().unwrap();
+        assert!(
+            fields.iter().any(|f| f["name"] == "KBS_SYNC_ID"),
+            "adopted item must carry the KBS_SYNC_ID stamp"
+        );
+    }
+
+    // Atomic save + reopen: entries intact (2 original + 1 adopted).
     save_vault(&vault).unwrap();
     let v2 = open_vault(&kdbx, &pw, None).unwrap();
-    assert_eq!(extract_entries(&v2.db).len(), 2);
+    assert_eq!(extract_entries(&v2.db).len(), 3);
 }

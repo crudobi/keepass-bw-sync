@@ -4,11 +4,41 @@
 //! tombstones, and the quarantine queue. It is what makes the engine's
 //! conflict decisions possible without trusting either side's clocks.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
+
+/// A journal mutation deferred by [`crate::sync::apply`] until the caller has
+/// durably saved the KeePass database. Committing these before `save_vault()`
+/// succeeds would let the journal claim KeePass mutations that never reached
+/// disk — a mid-apply bail or crash then corrupts the next run's conflict
+/// decisions (silent loss of foreign edits, or resurrection of deleted items).
+#[derive(Debug)]
+pub enum JournalOp {
+    UpsertMapping {
+        kp_uuid: Uuid,
+        bw_id: String,
+        hash: String,
+    },
+    RecordTombstone {
+        kp_uuid: Uuid,
+        bw_id: Option<String>,
+        side: &'static str,
+    },
+    DeleteMappingByKp {
+        kp_uuid: Uuid,
+    },
+    Quarantine {
+        kind: &'static str,
+        kp_uuid: Option<Uuid>,
+        bw_id: Option<String>,
+        title: String,
+        detail: String,
+    },
+}
 
 pub struct Journal {
     conn: Connection,
@@ -25,6 +55,14 @@ impl Journal {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("open journal {}", path.display()))?;
+        // The journal holds content hashes (offline-brute-forceable for weak
+        // passwords): keep it owner-only. Skip for :memory: databases.
+        #[cfg(unix)]
+        if path != Path::new(":memory:") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS mapping(
                  kp_uuid   TEXT PRIMARY KEY,
@@ -125,6 +163,18 @@ impl Journal {
         Ok(n)
     }
 
+    /// bw_ids of live (non-tombstoned) mappings: the only ones whose
+    /// Bitwarden item going missing from a listing counts as a delete.
+    pub fn live_mapped_bw_ids(&self) -> Result<HashSet<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT bw_id FROM mapping m WHERE NOT EXISTS
+             (SELECT 1 FROM tombstone t WHERE t.kp_uuid = m.kp_uuid)",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn quarantine(
         &self,
         kind: &str,
@@ -133,12 +183,25 @@ impl Journal {
         title: &str,
         detail: &str,
     ) -> Result<()> {
+        let kp = kp_uuid.map(|u| u.to_string());
+        // Dedup: an unresolved row for the same (identity, kind) already
+        // queues this case; don't pile up a duplicate every run.
+        // (`IS` is the NULL-safe equality: NULL IS NULL is true.)
+        let dup: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM quarantine WHERE resolved = 0 AND kind = ?1
+             AND kp_uuid IS ?2 AND bw_id IS ?3",
+            params![kind, kp, bw_id],
+            |r| r.get(0),
+        )?;
+        if dup > 0 {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO quarantine(kind, kp_uuid, bw_id, title, detail, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 kind,
-                kp_uuid.map(|u| u.to_string()),
+                kp,
                 bw_id,
                 title,
                 detail,
@@ -146,6 +209,15 @@ impl Journal {
             ],
         )?;
         Ok(())
+    }
+
+    /// Mark a quarantine row resolved. Returns true when an open row existed.
+    pub fn resolve_quarantine(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE quarantine SET resolved = 1 WHERE id = ?1 AND resolved = 0",
+            params![id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn list_quarantine(&self) -> Result<Vec<(i64, String, Option<String>, Option<String>, String, String)>> {
@@ -164,5 +236,103 @@ impl Journal {
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Commit deferred [`JournalOp`]s. The caller must invoke this only after
+    /// the KeePass database is durably saved: committing earlier would let
+    /// the journal claim KeePass mutations that never reached disk.
+    pub fn apply_ops(&self, ops: &[JournalOp]) -> Result<()> {
+        for op in ops {
+            match op {
+                JournalOp::UpsertMapping { kp_uuid, bw_id, hash } => {
+                    self.upsert_mapping(kp_uuid, bw_id, hash)?
+                }
+                JournalOp::RecordTombstone { kp_uuid, bw_id, side } => {
+                    self.record_tombstone(kp_uuid, bw_id.as_deref(), side)?;
+                }
+                JournalOp::DeleteMappingByKp { kp_uuid } => {
+                    self.delete_mapping_by_kp(kp_uuid)?;
+                }
+                JournalOp::Quarantine { kind, kp_uuid, bw_id, title, detail } => {
+                    self.quarantine(kind, kp_uuid.as_ref(), bw_id.as_deref(), title, detail)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_journal() -> Journal {
+        Journal::open(Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn mem_journal_skips_chmod() {
+        // :memory: must not trip the 0600 path; journal still works.
+        let j = mem_journal();
+        j.upsert_mapping(
+            &Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            "bw-1",
+            "h",
+        )
+        .unwrap();
+        assert_eq!(j.live_mapping_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn quarantine_dedups_unresolved_rows() {
+        let j = mem_journal();
+        let u = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        j.quarantine("foreign-bw-edit", Some(&u), Some("bw-1"), "t", "d")
+            .unwrap();
+        // Same (identity, kind) while unresolved: no duplicate row.
+        j.quarantine("foreign-bw-edit", Some(&u), Some("bw-1"), "t", "d")
+            .unwrap();
+        assert_eq!(j.list_quarantine().unwrap().len(), 1);
+        // Different kind is a separate case.
+        j.quarantine("concurrent-edit", Some(&u), Some("bw-1"), "t", "d")
+            .unwrap();
+        assert_eq!(j.list_quarantine().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn quarantine_resolve_closes_row() {
+        let j = mem_journal();
+        j.quarantine("k", None, Some("bw-9"), "t", "d").unwrap();
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(j.resolve_quarantine(rows[0].0).unwrap());
+        assert!(j.list_quarantine().unwrap().is_empty());
+        // Resolving twice is a no-op.
+        assert!(!j.resolve_quarantine(rows[0].0).unwrap());
+        assert!(!j.resolve_quarantine(9999).unwrap());
+    }
+
+    #[test]
+    fn apply_ops_commits_in_order() {
+        let j = mem_journal();
+        let u = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        j.apply_ops(&[
+            JournalOp::UpsertMapping {
+                kp_uuid: u,
+                bw_id: "bw-1".into(),
+                hash: "h".into(),
+            },
+            JournalOp::RecordTombstone {
+                kp_uuid: u,
+                bw_id: Some("bw-1".into()),
+                side: "keepass",
+            },
+            JournalOp::DeleteMappingByKp { kp_uuid: u },
+        ])
+        .unwrap();
+        assert!(j.tombstoned(&u).unwrap());
+        assert!(j.mapping_by_kp(&u).unwrap().is_none());
+        assert_eq!(j.live_mapping_count().unwrap(), 0);
+        assert!(j.live_mapped_bw_ids().unwrap().is_empty());
     }
 }

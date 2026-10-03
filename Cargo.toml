@@ -22,6 +22,7 @@ zeroize = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 sha2 = "0.10"
+fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
 rpassword = "7"
 hex = "0.4"

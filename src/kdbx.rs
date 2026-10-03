@@ -182,3 +182,14 @@ pub fn bw_adopt_entry(item: &crate::bw::BwItem) -> Entry {
     }
     e
 }
+
+/// Empty in-memory vault for unit tests (no real .kdbx touched).
+#[cfg(test)]
+pub fn test_vault() -> KdbxVault {
+    use keepass_rs::model::db::database::{Database, DatabaseVersion};
+    KdbxVault {
+        db: Database::new(DatabaseVersion::KDBX4),
+        key: CompositeKey::new(),
+        path: PathBuf::from("test.kdbx"),
+    }
+}

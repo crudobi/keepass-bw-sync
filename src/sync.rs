@@ -16,9 +16,9 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use crate::bw::{BwClient, BwFolder, BwItem};
+use crate::bw::{BwClient, BwFolder, BwItem, TrashOutcome};
 use crate::canonical::CanonicalEntry;
-use crate::journal::Journal;
+use crate::journal::{Journal, JournalOp};
 use crate::kdbx::{bw_adopt_entry, KdbxVault};
 use crate::secret::Secret;
 
@@ -34,15 +34,21 @@ pub struct SyncOpts {
 
 #[derive(Debug)]
 pub enum Action {
+    /// New KeePass entry: create the Bitwarden item.
     CreateBw { entry_idx: usize },
+    /// KeePass entry changed: update the Bitwarden item (revision-guarded).
     UpdateBw { bw_id: String, entry_idx: usize, expected_revision: String },
-    TrashBw { bw_id: String, kp_uuid: Uuid },
+    /// KeePass entry is in the recycle bin and Bitwarden is unchanged:
+    /// soft-delete the Bitwarden item (revision-guarded).
+    TrashBw { bw_id: String, kp_uuid: Uuid, expected_revision: String },
     /// Bitwarden trashed the item and KeePass did not change it: recycle in KP.
     RecycleKp { kp_uuid: Uuid, bw_id: String },
-    /// KeePass entry is in recycle bin and BW is unchanged: trash in BW.
+    /// Unmapped, unstamped Bitwarden item: adopt as a new KeePass entry
+    /// (only with --adopt), then stamp KBS_SYNC_ID back onto the BW item.
     AdoptBwNew { item_idx: usize },
     /// Foreign BW edit applied into KeePass (only with --writeback).
     WritebackEdit { bw_id: String, kp_uuid: Uuid, item_idx: usize },
+    /// Genuine conflict or unmappable item: queue for human review.
     Quarantine(QuarantineCase),
 }
 
@@ -64,7 +70,15 @@ fn stamp_uuid(item: &BwItem) -> Option<Uuid> {
     id.and_then(|s| s.parse().ok())
 }
 
-/// Build the sync plan. Pure apart from journal reads for identity mapping.
+/// Build the sync plan.
+///
+/// Not pure: it performs idempotent journal writes for identity recovery
+/// (stamped-but-unmapped Bitwarden items get their mapping upserted) and
+/// terminal bookkeeping (both-sides-deleted pairs). All per-action journal
+/// mutations are deferred — [`apply`] returns them as [`JournalOp`]s and the
+/// caller commits them via [`Journal::apply_ops`] only after the KeePass
+/// database is durably saved, so the journal can never claim KeePass
+/// mutations that never reached disk.
 pub fn plan(
     kp_entries: &[CanonicalEntry],
     kp_tombstones: &HashSet<Uuid>,
@@ -81,15 +95,31 @@ pub fn plan(
         .map(|(i, it)| (it.id.as_str(), i))
         .collect();
 
-    // Fail-closed: an empty Bitwarden listing while the journal holds live
-    // mappings is almost certainly a sync failure, not "the user deleted
-    // everything" (2026-10-03: this once recycled a whole test database).
-    // Refuse instead; a genuine mass Bitwarden delete needs an explicit
-    // journal reset.
-    if bw_items.is_empty() && journal.live_mapping_count()? > 0 {
-        anyhow::bail!(
-            "refusing to sync: Bitwarden listed 0 items but the journal holds live mappings (probable sync failure); no changes made"
-        );
+    // Fail-closed on transport failures. An empty Bitwarden listing while the
+    // journal holds live mappings is almost certainly a sync failure, not
+    // "the user deleted everything" (2026-10-03: this once recycled a whole
+    // test database) — and a *partial* listing is the same failure class in
+    // a different shape. Refuse instead; genuine mass Bitwarden deletes need
+    // an explicit journal reset. (Trashed items stay in the listing with
+    // deletedDate set, so a real mass-trash does not trip this guard.)
+    let live_ids = journal.live_mapped_bw_ids()?;
+    if bw_items.is_empty() {
+        if !live_ids.is_empty() {
+            anyhow::bail!(
+                "refusing to sync: Bitwarden listed 0 items but the journal holds {} live mappings (probable sync failure); no changes made",
+                live_ids.len()
+            );
+        }
+    } else {
+        let present: HashSet<&str> = bw_items.iter().map(|it| it.id.as_str()).collect();
+        let missing = live_ids.iter().filter(|id| !present.contains(id.as_str())).count();
+        if !live_ids.is_empty() && missing * 2 > live_ids.len() {
+            anyhow::bail!(
+                "refusing to sync: Bitwarden listing is missing {}/{} mapped items (probable partial listing); no changes made",
+                missing,
+                live_ids.len()
+            );
+        }
     }
 
     // Adopt stamped-but-unmapped items into the journal first (identity lives
@@ -113,7 +143,11 @@ pub fn plan(
                         continue; // already trashed on both sides
                     }
                     if it.content_hash_hex() == last_hash {
-                        actions.push(Action::TrashBw { bw_id, kp_uuid: e.uuid });
+                        actions.push(Action::TrashBw {
+                            bw_id,
+                            kp_uuid: e.uuid,
+                            expected_revision: it.revision_date.clone(),
+                        });
                     } else {
                         actions.push(Action::Quarantine(QuarantineCase {
                             kind: "delete-vs-edit",
@@ -228,10 +262,15 @@ pub fn plan(
         if let Some((bw_id, _)) = journal.mapping_by_kp(u)? {
             if let Some(&bi) = bw_by_id.get(bw_id.as_str()) {
                 if !bw_items[bi].trashed() {
-                    actions.push(Action::TrashBw { bw_id: bw_id.clone(), kp_uuid: *u });
+                    actions.push(Action::TrashBw {
+                        bw_id: bw_id.clone(),
+                        kp_uuid: *u,
+                        expected_revision: bw_items[bi].revision_date.clone(),
+                    });
                 }
             }
-            journal.record_tombstone(u, Some(&bw_id), "keepass")?;
+            // No plan-time tombstone here: the TrashBw apply arm records it
+            // as a deferred JournalOp, only when the trash is applied.
         }
     }
 
@@ -270,25 +309,31 @@ pub struct ApplyReport {
     pub quarantined: usize,
 }
 
-/// Execute the plan. KeePass mutations are applied to the in-memory database;
-/// the caller saves atomically afterwards.
+/// Execute the plan.
+///
+/// Bitwarden-side writes happen immediately; KeePass mutations are applied
+/// to the in-memory database (the caller saves atomically afterwards).
+/// Journal mutations are NOT performed here — they are returned as
+/// [`JournalOp`]s for the caller to commit via [`Journal::apply_ops`] only
+/// after `save_vault()` succeeds, so a mid-apply bail can never leave the
+/// journal claiming KeePass mutations that never reached disk.
 pub fn apply(
     plan: &Plan,
     kp_entries: &[CanonicalEntry],
     bw_items: &[BwItem],
     bw: &BwClient,
     vault: &mut KdbxVault,
-    journal: &Journal,
     folder_ids: &mut HashMap<String, String>,
     folders: &[BwFolder],
     opts: &SyncOpts,
-) -> Result<ApplyReport> {
+) -> Result<(ApplyReport, Vec<JournalOp>)> {
     let _ = opts;
     let mut folder_cache: HashMap<String, String> = folders
         .iter()
         .map(|f| (f.name.clone(), f.id.clone()))
         .collect();
     let mut report = ApplyReport::default();
+    let mut journal_ops: Vec<JournalOp> = Vec::new();
 
     let mut folder_for = |path: &str, bw: &BwClient| -> Result<Option<String>> {
         if path.is_empty() {
@@ -309,7 +354,11 @@ pub fn apply(
                 let e = &kp_entries[*entry_idx];
                 let fid = folder_for(&e.group_path, bw)?;
                 let bw_id = bw.create_item(e, fid.as_deref())?;
-                journal.upsert_mapping(&e.uuid, &bw_id, &e.content_hash_hex())?;
+                journal_ops.push(JournalOp::UpsertMapping {
+                    kp_uuid: e.uuid,
+                    bw_id,
+                    hash: e.content_hash_hex(),
+                });
                 report.created += 1;
             }
             Action::UpdateBw { bw_id, entry_idx, expected_revision } => {
@@ -317,14 +366,48 @@ pub fn apply(
                 let fid = folder_for(&e.group_path, bw)?;
                 bw.edit_item(bw_id, e, fid.as_deref(), expected_revision)
                     .with_context(|| format!("update bw item {}", bw_id))?;
-                journal.upsert_mapping(&e.uuid, bw_id, &e.content_hash_hex())?;
+                journal_ops.push(JournalOp::UpsertMapping {
+                    kp_uuid: e.uuid,
+                    bw_id: bw_id.clone(),
+                    hash: e.content_hash_hex(),
+                });
                 report.updated += 1;
             }
-            Action::TrashBw { bw_id, kp_uuid } => {
-                bw.trash_item(bw_id)?;
-                journal.record_tombstone(kp_uuid, Some(bw_id), "keepass")?;
-                journal.delete_mapping_by_kp(kp_uuid)?;
-                report.trashed += 1;
+            Action::TrashBw { bw_id, kp_uuid, expected_revision } => {
+                match bw
+                    .trash_item(bw_id, Some(expected_revision))
+                    .with_context(|| format!("trash bw item {}", bw_id))?
+                {
+                    TrashOutcome::Trashed => {
+                        // Tombstone first, mapping delete second: the ordering
+                        // that blocks delete/recreate resurrection loops.
+                        journal_ops.push(JournalOp::RecordTombstone {
+                            kp_uuid: *kp_uuid,
+                            bw_id: Some(bw_id.clone()),
+                            side: "keepass",
+                        });
+                        journal_ops.push(JournalOp::DeleteMappingByKp { kp_uuid: *kp_uuid });
+                        report.trashed += 1;
+                    }
+                    TrashOutcome::RevisionChanged => {
+                        // The item changed between plan and apply: the exact
+                        // delete-vs-edit race the engine quarantines
+                        // elsewhere. Skip the delete; queue for review.
+                        let title = kp_entries
+                            .iter()
+                            .find(|e| e.uuid == *kp_uuid)
+                            .map(|e| e.title.clone())
+                            .unwrap_or_else(|| bw_id.clone());
+                        journal_ops.push(JournalOp::Quarantine {
+                            kind: "bw_revision_changed",
+                            kp_uuid: Some(*kp_uuid),
+                            bw_id: Some(bw_id.clone()),
+                            title,
+                            detail: "Bitwarden item changed between plan and apply; trash skipped pending review".into(),
+                        });
+                        report.quarantined += 1;
+                    }
+                }
             }
             Action::RecycleKp { kp_uuid, bw_id } => {
                 eprintln!(
@@ -332,8 +415,12 @@ pub fn apply(
                 );
                 let nid = keepass_rs::model::core::node::NodeId::from_uuid(*kp_uuid);
                 if vault.db.remove_entry(&nid, true).is_some() {
-                    journal.record_tombstone(kp_uuid, Some(bw_id), "bitwarden")?;
-                    journal.delete_mapping_by_kp(kp_uuid)?;
+                    journal_ops.push(JournalOp::RecordTombstone {
+                        kp_uuid: *kp_uuid,
+                        bw_id: Some(bw_id.clone()),
+                        side: "bitwarden",
+                    });
+                    journal_ops.push(JournalOp::DeleteMappingByKp { kp_uuid: *kp_uuid });
                     report.kp_recycled += 1;
                 }
             }
@@ -347,7 +434,16 @@ pub fn apply(
                     .clone()
                     .context("no root group")?;
                 if vault.db.add_entry(entry, &root) {
-                    journal.upsert_mapping(&uuid, &it.id, &it.content_hash_hex())?;
+                    let hash = it.content_hash_hex();
+                    // Write the identity stamp back so the hybrid identity
+                    // holds in both directions on future runs.
+                    bw.stamp_item(&it.id, &uuid, &hash)
+                        .with_context(|| format!("stamp adopted item {}", it.id))?;
+                    journal_ops.push(JournalOp::UpsertMapping {
+                        kp_uuid: uuid,
+                        bw_id: it.id.clone(),
+                        hash,
+                    });
                     report.kp_adopted += 1;
                 }
             }
@@ -359,17 +455,27 @@ pub fn apply(
                     let snapshot = entry.clone();
                     entry.history.push(snapshot);
                     apply_bw_to_entry(entry, it);
-                    journal.upsert_mapping(kp_uuid, bw_id, &it.content_hash_hex())?;
+                    journal_ops.push(JournalOp::UpsertMapping {
+                        kp_uuid: *kp_uuid,
+                        bw_id: bw_id.clone(),
+                        hash: it.content_hash_hex(),
+                    });
                     report.writeback_applied += 1;
                 }
             }
             Action::Quarantine(q) => {
-                journal.quarantine(&q.kind, q.kp_uuid.as_ref(), q.bw_id.as_deref(), &q.title, &q.detail)?;
+                journal_ops.push(JournalOp::Quarantine {
+                    kind: q.kind,
+                    kp_uuid: q.kp_uuid,
+                    bw_id: q.bw_id.clone(),
+                    title: q.title.clone(),
+                    detail: q.detail.clone(),
+                });
                 report.quarantined += 1;
             }
         }
     }
-    Ok(report)
+    Ok((report, journal_ops))
 }
 
 /// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
@@ -401,7 +507,7 @@ fn apply_bw_to_entry(
         entry.custom_fields.push(keepass_rs::model::entry::EntryField {
             name: f.name.clone(),
             value: PS::new_protected(&f.value),
-            is_protected: false,
+            is_protected: true,
         });
     }
     if let Some(t) = login.totp.filter(|s| !s.is_empty()) {
@@ -424,7 +530,7 @@ pub fn test_secret(s: &str) -> Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bw::BwLogin;
+    use crate::bw::{BwClient, BwLogin};
     use crate::canonical::CanonicalEntry;
     use crate::secret::Secret;
 
@@ -575,5 +681,129 @@ mod tests {
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
         let r = plan(&kp, &HashSet::new(), &[], &j, &SyncOpts::default());
         assert!(r.is_err(), "expected plan to bail on empty listing with live mappings");
+    }
+
+    fn mapped_pair(j: &Journal, i: u8) -> (CanonicalEntry, BwItem) {
+        let e = entry(&format!("11111111-1111-1111-1111-11111111111{i}"));
+        let id = format!("bw-{i}");
+        let bi = bw_item(&id, Some(&format!("11111111-1111-1111-1111-11111111111{i}")), "r1");
+        // entry() and bw_item() agree on content, so both sides hash equal.
+        let h = bi.content_hash_hex();
+        assert_eq!(e.content_hash_hex(), h);
+        j.upsert_mapping(&e.uuid, &id, &h).unwrap();
+        (e, bi)
+    }
+
+    #[test]
+    fn partial_listing_missing_majority_bails() {
+        // Only a fully-empty listing used to trip the fail-closed guard; a
+        // truncated listing walked into mass RecycleKp. Bail when more than
+        // half of the live-mapped items are missing from the listing.
+        let j = mem_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        let listed = vec![items[0].clone()]; // 3/4 missing > 1/2
+        let r = plan(&kp, &HashSet::new(), &listed, &j, &SyncOpts::default());
+        assert!(r.is_err(), "expected bail on partial listing missing the majority");
+    }
+
+    #[test]
+    fn partial_listing_missing_minority_plans_recycle() {
+        // 1 of 4 missing is a genuine single delete, not a transport
+        // failure: plan the one recycle, nothing else.
+        let j = mem_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        let listed: Vec<BwItem> = items[..3].to_vec();
+        let p = plan(&kp, &HashSet::new(), &listed, &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(matches!(p.actions[0], Action::RecycleKp { .. }));
+    }
+
+    #[test]
+    fn trash_plan_carries_expected_revision() {
+        let j = mem_journal();
+        let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        kp[0].deleted = true; // in the KeePass recycle bin
+        let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r42");
+        let h = bi.content_hash_hex();
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
+        let p = plan(&kp, &HashSet::new(), &[bi], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            matches!(&p.actions[0], Action::TrashBw { expected_revision, .. } if expected_revision == "r42"),
+            "TrashBw must carry the plan-time revision for the apply-time guard"
+        );
+    }
+
+    #[test]
+    fn apply_error_leaves_journal_untouched() {
+        // Regression: journal writes used to happen inside apply(), so a
+        // mid-apply bail (e.g. a 503 on a later action) left the journal
+        // claiming KeePass mutations that never reached disk. Ops are now
+        // collected and only committed via Journal::apply_ops.
+        let j = mem_journal();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let p = Plan {
+            actions: vec![
+                Action::Quarantine(QuarantineCase {
+                    kind: "test-kind",
+                    kp_uuid: Some(kp[0].uuid),
+                    bw_id: None,
+                    title: "t".into(),
+                    detail: "d".into(),
+                }),
+                // Dead URL (connection refused): this action fails.
+                Action::CreateBw { entry_idx: 0 },
+            ],
+        };
+        let bw = BwClient::new("http://127.0.0.1:1").unwrap();
+        let mut vault = crate::kdbx::test_vault();
+        let mut folder_ids = HashMap::new();
+        let r = apply(&p, &kp, &[], &bw, &mut vault, &mut folder_ids, &[], &SyncOpts::default());
+        assert!(r.is_err(), "expected apply to fail on the dead URL");
+        assert!(
+            j.list_quarantine().unwrap().is_empty(),
+            "journal must be untouched when apply bails partway"
+        );
+        assert_eq!(j.live_mapping_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_ops_commit_only_via_apply_ops() {
+        let j = mem_journal();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let p = Plan {
+            actions: vec![Action::Quarantine(QuarantineCase {
+                kind: "test-kind",
+                kp_uuid: Some(kp[0].uuid),
+                bw_id: None,
+                title: "t".into(),
+                detail: "d".into(),
+            })],
+        };
+        let bw = BwClient::new("http://127.0.0.1:1").unwrap();
+        let mut vault = crate::kdbx::test_vault();
+        let mut folder_ids = HashMap::new();
+        let (report, ops) =
+            apply(&p, &kp, &[], &bw, &mut vault, &mut folder_ids, &[], &SyncOpts::default())
+                .unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(ops.len(), 1);
+        assert!(
+            j.list_quarantine().unwrap().is_empty(),
+            "apply itself must not commit journal ops"
+        );
+        j.apply_ops(&ops).unwrap();
+        assert_eq!(j.list_quarantine().unwrap().len(), 1);
     }
 }
