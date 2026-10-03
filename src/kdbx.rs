@@ -212,3 +212,190 @@ pub fn test_vault() -> KdbxVault {
         path: PathBuf::from("test.kdbx"),
     }
 }
+
+/// Look up a single entry by exact title and return one field value.
+///
+/// The field argument is one of: password (default), username, url, totp,
+/// notes, or a custom-field name (matched case-insensitively). Zero matches
+/// errors; multiple matches error listing each entry group path so the
+/// caller can disambiguate.
+///
+/// The consumption path for automation: workers pull secrets from the local
+/// .kdbx without touching the sync journal or Bitwarden.
+pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret> {
+    let c2p = child_to_parent(db);
+    let mut hits: Vec<(&NodeId, &Entry)> = db
+        .entries
+        .iter()
+        .filter(|(_, e)| e.title == title)
+        .collect();
+    hits.sort_by(|a, b| {
+        group_path(db, a.0, &c2p)
+            .cmp(&group_path(db, b.0, &c2p))
+            .then(a.1.title.cmp(&b.1.title))
+    });
+    match hits.len() {
+        0 => anyhow::bail!("no entry titled {:?}", title),
+        1 => {
+            let (_, e) = hits[0];
+            Ok(Secret::new(entry_field_bytes(e, field)?))
+        }
+        _ => {
+            let paths: Vec<String> = hits
+                .iter()
+                .map(|(eid, e)| {
+                    let gp = group_path(db, eid, &c2p);
+                    if gp.is_empty() {
+                        e.title.clone()
+                    } else {
+                        format!("{}/{}", gp, e.title)
+                    }
+                })
+                .collect();
+            anyhow::bail!(
+                "multiple entries titled {:?}:\n  {}",
+                title,
+                paths.join("\n  ")
+            )
+        }
+    }
+}
+
+/// Raw bytes of one entry field. Custom fields are matched case-insensitively;
+/// an unknown name errors listing the available field names.
+fn entry_field_bytes(e: &Entry, field: &str) -> Result<Vec<u8>> {
+    let lowered = field.to_ascii_lowercase();
+    match lowered.as_str() {
+        "password" => Ok(ps_bytes(&e.password)),
+        "username" => Ok(ps_bytes(&e.username)),
+        "url" => Ok(e.url.as_bytes().to_vec()),
+        "totp" => Ok(extract_totp(e).unwrap_or_default().into_bytes()),
+        "notes" => Ok(ps_bytes(&e.notes)),
+        custom => match e
+            .custom_fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(custom))
+        {
+            Some(f) => Ok(ps_bytes(&f.value)),
+            None => {
+                let mut names = vec!["password", "username", "url", "totp", "notes"];
+                names.extend(e.custom_fields.iter().map(|f| f.name.as_str()));
+                anyhow::bail!(
+                    "no field {:?} on entry {:?}; available: {}",
+                    field,
+                    e.title,
+                    names.join(", ")
+                )
+            }
+        },
+    }
+}
+
+fn ps_bytes(p: &ProtectedString) -> Vec<u8> {
+    p.as_str().as_bytes().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keepass_rs::model::core::node::NodeId;
+    use keepass_rs::model::core::security::ProtectedString as PS;
+    use keepass_rs::model::db::database::{Database, DatabaseVersion};
+    use keepass_rs::model::entry::{Entry, EntryField};
+    use keepass_rs::model::group::Group;
+
+    fn add_group(db: &mut Database, title: &str, parent: &NodeId) -> NodeId {
+        let id = NodeId::new_uuid();
+        let mut g = Group::new(id.clone());
+        g.title = title.to_string();
+        assert!(db.add_group(g, parent), "add_group {}", title);
+        id
+    }
+
+    /// "github" is unique and fully populated; "deploy key" exists twice
+    /// (Ops and Misc) for the ambiguity test.
+    fn fixture_db() -> Database {
+        let mut db = Database::new(DatabaseVersion::KDBX4);
+        let root_id = NodeId::new_uuid();
+        let mut root = Group::new(root_id);
+        root.title = "Root".to_string();
+        assert!(db.add_group(root, &NodeId::new_uuid()));
+        let root = db.root_group_id.clone().unwrap();
+
+        let ops = add_group(&mut db, "Ops", &root);
+        let misc = add_group(&mut db, "Misc", &root);
+
+        let mut e = Entry::new(NodeId::new_uuid());
+        e.title = "github".to_string();
+        e.username = PS::new_protected("alice");
+        e.password = PS::new_protected("s3cr3t-pw");
+        e.url = "https://github.com".to_string();
+        e.notes = PS::new_protected("some notes");
+        e.custom_fields.push(EntryField {
+            name: "totp".to_string(),
+            value: PS::new_protected("JBSWY3DPEHPK3PXP"),
+            is_protected: true,
+        });
+        e.custom_fields.push(EntryField {
+            name: "API Key".to_string(),
+            value: PS::new_protected("ak-123"),
+            is_protected: true,
+        });
+        assert!(db.add_entry(e, &ops));
+
+        for parent in [&ops, &misc] {
+            let mut d = Entry::new(NodeId::new_uuid());
+            d.title = "deploy key".to_string();
+            d.username = PS::new_protected("deployer");
+            d.password = PS::new_protected("key-pw");
+            assert!(db.add_entry(d, parent));
+        }
+        db
+    }
+
+    fn get(db: &Database, title: &str, field: &str) -> String {
+        let s = get_entry_field(db, title, field).map_err(|e| e.to_string()).unwrap();
+        String::from_utf8_lossy(s.expose()).into_owned()
+    }
+
+    fn get_err(db: &Database, title: &str, field: &str) -> String {
+        get_entry_field(db, title, field).map(|_| ()).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn get_returns_each_field() {
+        let db = fixture_db();
+        assert_eq!(get(&db, "github", "password"), "s3cr3t-pw");
+        assert_eq!(get(&db, "github", "username"), "alice");
+        assert_eq!(get(&db, "github", "url"), "https://github.com");
+        assert_eq!(get(&db, "github", "totp"), "JBSWY3DPEHPK3PXP");
+        assert_eq!(get(&db, "github", "notes"), "some notes");
+        assert_eq!(get(&db, "github", "API Key"), "ak-123");
+        // Custom-field names match case-insensitively.
+        assert_eq!(get(&db, "github", "api key"), "ak-123");
+    }
+
+    #[test]
+    fn get_unknown_title_errors() {
+        let db = fixture_db();
+        let msg = get_err(&db, "nope", "password");
+        assert!(msg.contains("no entry titled"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn get_duplicate_title_errors_with_group_paths() {
+        let db = fixture_db();
+        let msg = get_err(&db, "deploy key", "password");
+        assert!(msg.contains("multiple entries"), "unexpected error: {msg}");
+        assert!(msg.contains("Ops"), "missing Ops path: {msg}");
+        assert!(msg.contains("Misc"), "missing Misc path: {msg}");
+    }
+
+    #[test]
+    fn get_unknown_field_errors_with_available_names() {
+        let db = fixture_db();
+        let msg = get_err(&db, "github", "bogus");
+        assert!(msg.contains("no field"), "unexpected error: {msg}");
+        assert!(msg.contains("API Key"), "missing custom name: {msg}");
+    }
+}

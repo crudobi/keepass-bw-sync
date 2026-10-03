@@ -5,7 +5,9 @@ use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use keepass_bw_sync::bw::BwClient;
 use keepass_bw_sync::journal::Journal;
-use keepass_bw_sync::kdbx::{extract_entries, open_vault, save_vault, tombstoned_uuids};
+use keepass_bw_sync::kdbx::{
+    extract_entries, get_entry_field, open_vault, save_vault, tombstoned_uuids,
+};
 use keepass_bw_sync::secret::Secret;
 use keepass_bw_sync::sync::{apply, plan, SyncOpts};
 
@@ -54,6 +56,20 @@ enum Cmd {
     Journal {
         #[command(subcommand)]
         action: JournalCmd,
+    },
+    /// Print one entry field to stdout with no trailing newline (scripting).
+    /// Reads the local .kdbx only: no journal, no Bitwarden, no lock.
+    Get {
+        /// Path to the KeePass2 database.
+        #[arg(long)]
+        kdbx: PathBuf,
+        /// Exact entry title.
+        #[arg(long)]
+        title: String,
+        /// Field: password (default), username, url, totp, notes, or a
+        /// custom-field name (case-insensitive).
+        #[arg(long, default_value = "password")]
+        field: String,
     },
 }
 
@@ -222,6 +238,19 @@ fn main() -> Result<()> {
                 println!("created fresh journal at {}", journal.display());
             }
         },
+        Cmd::Get { kdbx, title, field } => {
+            let pw = master_password()?;
+            let vault = open_vault(&kdbx, &pw, None)?;
+            drop(pw); // master password leaves scope before any output
+            let value = get_entry_field(&vault.db, &title, &field)?;
+            {
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(value.expose())
+                    .context("write field value to stdout")?;
+            }
+            // The returned Secret zeroizes its bytes on drop.
+        }
     }
     Ok(())
 }

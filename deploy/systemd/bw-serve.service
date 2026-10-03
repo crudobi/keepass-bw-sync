@@ -1,0 +1,19 @@
+[Unit]
+Description=Bitwarden CLI serve API (dev-loop secrets sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crudobi
+# Optional until the Bitwarden account is hardened (see README):
+# /store/muscle/secrets/bw.env must define BW_PASSWORD (0600).
+EnvironmentFile=-/store/muscle/secrets/bw.env
+ExecStart=/usr/local/bin/bw-serve.sh
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

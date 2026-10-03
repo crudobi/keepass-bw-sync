@@ -75,6 +75,71 @@ keepass-bw-sync journal reset --journal /path/to/sync.db
 The old journal is archived to `sync.bak-<unix-timestamp>` (quarantine
 history and tombstones preserved for forensics).
 
+## Dev-loop secrets integration (phase 1)
+
+The local `.kdbx` is the source of truth for machine secrets; Bitwarden is
+the encrypted offsite copy ("survival offsite"). Workers consume secrets
+with `get` — they never need the sync journal or Bitwarden access.
+
+```sh
+# print one field to stdout with no trailing newline (script-safe):
+keepass-bw-sync get --kdbx /store/muscle/secrets/vault.kdbx \
+  --title "Deploy Key" --field password
+# field: password (default) | username | url | totp | notes | <custom name>
+```
+
+Exact title match; duplicates error listing each entry's group path so you
+can disambiguate. Unknown fields error listing the available names.
+
+### Layout on waflurgiooh
+
+- `/store/muscle/secrets/vault.kdbx` — production vault (0600)
+- `/store/muscle/secrets/vault.env` — `KBS_MASTER_PASSWORD=...` (0600, never printed)
+- `/store/muscle/secrets/sync.db` — sync journal (created on first sync)
+- `/store/muscle/secrets/bw.env` — `BW_PASSWORD=...` (0600) — DOES NOT EXIST YET
+
+### systemd units (installed, NOT enabled)
+
+`deploy/systemd/` holds the unit sources. They are installed to
+`/etc/systemd/system/` and `/usr/local/bin/` (`systemd-analyze verify`
+clean) but deliberately left disabled — the Bitwarden account is not
+hardened yet (see checklist).
+
+- `bw-serve.service` — supervised `bw serve` via `/usr/local/bin/bw-serve.sh`
+  (`Restart=always`; fails closed when `BW_PASSWORD` is unset; the
+  `EnvironmentFile=-...` is optional until the account is hardened).
+- `kbs-sync.service` — oneshot sync with default safe flags
+  (no `--force` / `--adopt` / `--writeback`; foreign Bitwarden edits
+  quarantine for human review). `Requires=bw-serve.service`.
+- `kbs-sync.timer` — hourly, `Persistent=true`, `RandomizedDelaySec=600`.
+
+The release binary is installed at `/usr/local/bin/keepass-bw-sync`.
+
+### Account-hardening checklist (unblocks enabling the timer)
+
+1. Rotate the Bitwarden master password (the test password is compromised —
+   it appeared in a chat transcript).
+2. Enable 2FA on the Bitwarden account.
+3. Create `/store/muscle/secrets/bw.env` (0600) with `BW_PASSWORD=...`
+   (or `BW_CLIENTID` / `BW_CLIENTSECRET` for API-key login, which bypasses
+   2FA for headless use).
+4. `sudo systemctl enable --now bw-serve.service kbs-sync.timer`
+5. Migrate secrets into the vault one by one, verifying each with
+   `keepass-bw-sync get`.
+6. Run a restore drill: fresh host, `bw` login, export, rebuild — before
+   trusting the offsite copy.
+
+### One-off vault init
+
+`examples/mkvault.rs` creates an empty KDBX4 vault. It reads
+`KBS_MASTER_PASSWORD` from the environment and fails closed when unset:
+
+```sh
+set -a; source /store/muscle/secrets/vault.env; set +a
+cargo run --offline --example mkvault -- /store/muscle/secrets/vault.kdbx
+chmod 600 /store/muscle/secrets/vault.kdbx
+```
+
 ## Layout
 
 - `src/secret.rs` — zeroized secret newtype

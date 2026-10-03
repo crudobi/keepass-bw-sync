@@ -1,0 +1,15 @@
+[Unit]
+Description=KeePass2 <-> Bitwarden sync (dev-loop secrets, offsite backup)
+Requires=bw-serve.service
+After=bw-serve.service
+
+[Service]
+Type=oneshot
+User=crudobi
+EnvironmentFile=/store/muscle/secrets/vault.env
+ExecStart=/usr/local/bin/keepass-bw-sync sync --kdbx /store/muscle/secrets/vault.kdbx --journal /store/muscle/secrets/sync.db
+# Default safe flags: no --force, --adopt, or --writeback.
+# Foreign Bitwarden edits quarantine for human review.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly KeePass2 <-> Bitwarden sync (dev-loop secrets)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=600
+Unit=kbs-sync.service
+
+[Install]
+WantedBy=timers.target
