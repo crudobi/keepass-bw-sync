@@ -22,7 +22,6 @@ pub struct CanonicalEntry {
     /// (name, value) pairs; order normalized at hash time.
     pub custom: Vec<(String, String)>,
     pub group_path: String,
-    pub last_modified_ms: i64,
     /// True when the entry lives in the KeePass recycle bin.
     pub deleted: bool,
 }
@@ -35,6 +34,13 @@ fn write_field(h: &mut Sha256, tag: &str, data: &[u8]) {
 }
 
 /// Stable content hash over the syncable fields of an entry.
+///
+/// The Bitwarden URI `match` strategy is deliberately NOT hashed: KeePass
+/// has no per-URI match concept, so hashing it would make every adopted
+/// item with an explicit non-null match permanently disagree with its
+/// KeePass twin (adopt → spurious UpdateBw → false foreign-edit
+/// quarantine, forever). The engine echoes `match` back on PUTs instead,
+/// so it is never silently reset — it just isn't change-detected.
 pub fn hash_fields(
     title: &str,
     username: &str,

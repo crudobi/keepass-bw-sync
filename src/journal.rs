@@ -241,24 +241,45 @@ impl Journal {
     /// Commit deferred [`JournalOp`]s. The caller must invoke this only after
     /// the KeePass database is durably saved: committing earlier would let
     /// the journal claim KeePass mutations that never reached disk.
+    ///
+    /// Commits atomically: the ops run inside a single transaction, so a
+    /// mid-commit failure rolls back instead of leaving a partial op
+    /// sequence. `&self` is enough — `execute_batch` runs the transaction
+    /// statements on the same connection without needing `&mut`.
     pub fn apply_ops(&self, ops: &[JournalOp]) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("begin journal transaction")?;
+        let mut r = Ok(());
         for op in ops {
-            match op {
+            r = match op {
                 JournalOp::UpsertMapping { kp_uuid, bw_id, hash } => {
-                    self.upsert_mapping(kp_uuid, bw_id, hash)?
+                    self.upsert_mapping(kp_uuid, bw_id, hash)
                 }
                 JournalOp::RecordTombstone { kp_uuid, bw_id, side } => {
-                    self.record_tombstone(kp_uuid, bw_id.as_deref(), side)?;
+                    self.record_tombstone(kp_uuid, bw_id.as_deref(), side)
                 }
                 JournalOp::DeleteMappingByKp { kp_uuid } => {
-                    self.delete_mapping_by_kp(kp_uuid)?;
+                    self.delete_mapping_by_kp(kp_uuid)
                 }
                 JournalOp::Quarantine { kind, kp_uuid, bw_id, title, detail } => {
-                    self.quarantine(kind, kp_uuid.as_ref(), bw_id.as_deref(), title, detail)?;
+                    self.quarantine(kind, kp_uuid.as_ref(), bw_id.as_deref(), title, detail)
                 }
+            };
+            if r.is_err() {
+                break;
             }
         }
-        Ok(())
+        match r {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .context("commit journal transaction"),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e).context("apply journal ops")
+            }
+        }
     }
 }
 
@@ -334,5 +355,22 @@ mod tests {
         assert!(j.mapping_by_kp(&u).unwrap().is_none());
         assert_eq!(j.live_mapping_count().unwrap(), 0);
         assert!(j.live_mapped_bw_ids().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_file_is_owner_only() {
+        // The journal holds identities (UUID <-> Bitwarden id). It must be
+        // created 0600; a regression here would expose the mapping to other
+        // local users.
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("kbs-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("sync.db");
+        let _ = std::fs::remove_file(&p);
+        let _j = Journal::open(&p).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "journal must be 0600, got {:o}", mode);
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -10,7 +10,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use keepass_rs::model::core::date::DateInstant;
 use keepass_rs::model::core::node::NodeId;
 use keepass_rs::model::core::security::ProtectedString;
 use keepass_rs::model::db::composite_key::CompositeKey;
@@ -21,6 +20,7 @@ use uuid::Uuid;
 
 use crate::canonical::CanonicalEntry;
 use crate::secret::Secret;
+use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
 
 pub struct KdbxVault {
     pub db: Database,
@@ -83,10 +83,6 @@ fn group_path(db: &Database, entry_id: &NodeId, c2p: &HashMap<NodeId, NodeId>) -
     parts.join("/")
 }
 
-fn ms(t: &DateInstant) -> i64 {
-    t.as_millis().unwrap_or(0)
-}
-
 /// TOTP is carried as a plain custom field named "totp" (case-insensitive).
 fn extract_totp(entry: &Entry) -> Option<String> {
     entry
@@ -120,7 +116,6 @@ fn entry_to_canonical(db: &Database, eid: &NodeId, entry: &Entry, c2p: &HashMap<
         totp: extract_totp(entry),
         custom,
         group_path: group_path(db, eid, c2p),
-        last_modified_ms: ms(&entry.last_modification_time),
         deleted,
     }
 }
@@ -159,6 +154,13 @@ pub fn save_vault(v: &KdbxVault) -> Result<()> {
 }
 
 /// Build a fresh entry from Bitwarden-side content (adopt path).
+///
+/// Bitwarden custom fields ride along as KeePass custom fields (protected),
+/// minus the sync stamps, which the adopt arm stamps back onto the Bitwarden
+/// item instead of copying into KeePass. A field named "totp" (case
+/// insensitive) is skipped when the item carries a real TOTP — KeePass
+/// represents TOTP as its own field, and the collision would double-count in
+/// [`CanonicalEntry::content_hash`].
 pub fn bw_adopt_entry(item: &crate::bw::BwItem) -> Entry {
     use keepass_rs::model::core::security::ProtectedString as PS;
     let mut e = Entry::new(NodeId::new_uuid());
@@ -173,10 +175,27 @@ pub fn bw_adopt_entry(item: &crate::bw::BwItem) -> Entry {
         .find_map(|u| u.uri)
         .unwrap_or_default();
     e.notes = PS::new_protected(item.notes.as_deref().unwrap_or_default());
-    if let Some(t) = login.totp.filter(|s| !s.is_empty()) {
+    let totp = login.totp.clone().filter(|s| !s.is_empty());
+    if let Some(t) = totp {
         e.custom_fields.push(keepass_rs::model::entry::EntryField {
             name: "totp".to_string(),
             value: PS::new_protected(&t),
+            is_protected: true,
+        });
+    }
+    // A field named "totp" collides with the real TOTP above and would
+    // double-count in `CanonicalEntry::content_hash`; skip it then.
+    let skip_totp = login.totp.map(|s| !s.is_empty()).unwrap_or(false);
+    for f in &item.fields {
+        if f.name == SYNC_ID_FIELD || f.name == SYNC_HASH_FIELD {
+            continue;
+        }
+        if skip_totp && f.name.eq_ignore_ascii_case("totp") {
+            continue;
+        }
+        e.custom_fields.push(keepass_rs::model::entry::EntryField {
+            name: f.name.clone(),
+            value: PS::new_protected(&f.value),
             is_protected: true,
         });
     }

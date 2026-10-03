@@ -22,14 +22,33 @@ use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BwUri {
     pub uri: Option<String>,
+    /// Bitwarden URI match strategy (0=default … 6=never). Echoed back on
+    /// PUTs so engine edits never silently reset it. Deliberately excluded
+    /// from the content hash (see `hash_fields`): KeePass cannot represent
+    /// it, so hashing it would permanently disagree on adopted items.
+    #[serde(rename = "match", default)]
+    pub match_: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct BwLogin {
     pub username: Option<String>,
     pub password: Option<String>,
     pub totp: Option<String>,
     pub uris: Option<Vec<BwUri>>,
+}
+
+// Redacting Debug: this struct holds plaintext secrets; one stray `{:?}`
+// must never land them in a log.
+impl std::fmt::Debug for BwLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwLogin")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("totp", &self.totp.as_ref().map(|_| "<redacted>"))
+            .field("uris", &self.uris)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,7 +57,7 @@ pub struct BwField {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BwItem {
     pub id: String,
     pub name: String,
@@ -53,6 +72,42 @@ pub struct BwItem {
     pub revision_date: String,
     #[serde(rename = "deletedDate")]
     pub deleted_date: Option<String>,
+    /// Bitwarden item type: 1=login, 2=secure note, 3=card, 4=identity.
+    /// The engine only manages logins; other types quarantine on adopt.
+    #[serde(rename = "type", default)]
+    pub item_type: i32,
+    /// Master-password reprompt policy. Echoed back on PUTs (the real serve
+    /// resets it to None when omitted); excluded from the content hash —
+    /// it is a policy flag, not content.
+    #[serde(default)]
+    pub reprompt: Option<i32>,
+}
+
+// Redacting Debug: custom-field values can hold secrets (API keys, …);
+// show field names only, never values.
+impl std::fmt::Debug for BwItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwItem")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("notes", &self.notes.as_ref().map(|_| "<redacted>"))
+            .field("favorite", &self.favorite)
+            .field("folder_id", &self.folder_id)
+            .field("login", &self.login)
+            .field(
+                "fields",
+                &self
+                    .fields
+                    .iter()
+                    .map(|x| &x.name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("revision_date", &self.revision_date)
+            .field("deleted_date", &self.deleted_date)
+            .field("item_type", &self.item_type)
+            .field("reprompt", &self.reprompt)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,10 +311,18 @@ impl BwClient {
 
     /// Build the `bw create/edit item` payload. The password is copied into a
     /// `Zeroizing<String>` so the transient plaintext is wiped after use.
+    ///
+    /// `echo_src` is the current server-side item (present on edit): its
+    /// `type`, `reprompt`, and the URI `match` of the synced URL are echoed
+    /// back, because the real serve applies `toView` replace semantics —
+    /// omitting them would silently reset the URI match strategy and disable
+    /// master-password reprompt. Creates have no source item (type 1, no
+    /// reprompt, no match).
     pub fn item_payload(
         entry: &CanonicalEntry,
         folder_id: Option<&str>,
         sync_hash_hex: &str,
+        echo_src: Option<&BwItem>,
     ) -> serde_json::Value {
         let pw: Zeroizing<String> =
             Zeroizing::new(String::from_utf8_lossy(entry.password.expose()).into_owned());
@@ -270,16 +333,28 @@ impl BwClient {
         for (k, v) in &entry.custom {
             fields.push(serde_json::json!({"name": k, "value": v, "type": 0}));
         }
+        // Echo the match strategy of the same URL when the source item has
+        // one; the engine's KeePass-side model has no per-URI match of its
+        // own, so there is nothing else to compare against.
+        let uri_match = echo_src
+            .and_then(|s| s.login.as_ref())
+            .and_then(|l| l.uris.as_ref())
+            .and_then(|uris| {
+                uris.iter()
+                    .find(|u| u.uri.as_deref() == Some(entry.url.as_str()))
+            })
+            .and_then(|u| u.match_);
         let mut uris = vec![];
         if !entry.url.is_empty() {
-            uris.push(serde_json::json!({"uri": entry.url}));
+            uris.push(serde_json::json!({"uri": entry.url, "match": uri_match}));
         }
         serde_json::json!({
-            "type": 1,
+            "type": echo_src.map(|s| s.item_type).unwrap_or(1),
             "name": entry.title,
             "notes": entry.notes,
             "favorite": false,
             "folderId": folder_id,
+            "reprompt": echo_src.and_then(|s| s.reprompt),
             "fields": fields,
             "login": {
                 "username": entry.username,
@@ -300,7 +375,7 @@ impl BwClient {
             id: String,
         }
         let hash = entry.content_hash_hex();
-        let payload = Self::item_payload(entry, folder_id, &hash);
+        let payload = Self::item_payload(entry, folder_id, &hash, None);
         let resp = self
             .http
             .post(format!("{}/object/item", self.base))
@@ -328,7 +403,7 @@ impl BwClient {
             );
         }
         let hash = entry.content_hash_hex();
-        let payload = Self::item_payload(entry, folder_id, &hash);
+        let payload = Self::item_payload(entry, folder_id, &hash, Some(&cur));
         let resp = self
             .http
             .put(format!("{}/object/item/{}", self.base, id))
@@ -375,8 +450,10 @@ impl BwClient {
     /// Stamp `KBS_SYNC_ID` / `KBS_SYNC_HASH` onto an existing item (adopt
     /// path: the item predates the engine). Skips when already stamped.
     /// Operates on a fresh read; the PUT carries the full item plus the two
-    /// stamp fields. Content hashes exclude the stamps, so the journal hash
-    /// recorded at adopt time stays valid.
+    /// stamp fields, echoing back `type`, `reprompt`, and URI `match` —
+    /// the real serve applies `toView` replace semantics, so omitting them
+    /// would silently reset them. Content hashes exclude the stamps, so the
+    /// journal hash recorded at adopt time stays valid.
     pub fn stamp_item(&self, id: &str, kp_uuid: &Uuid, hash_hex: &str) -> Result<()> {
         let it = self.get_item(id)?;
         if it.stamps().0.is_some() {
@@ -398,14 +475,15 @@ impl BwClient {
             .uris
             .unwrap_or_default()
             .iter()
-            .map(|u| serde_json::json!({"uri": u.uri}))
+            .map(|u| serde_json::json!({"uri": u.uri, "match": u.match_}))
             .collect();
         let payload = serde_json::json!({
-            "type": 1,
+            "type": it.item_type,
             "name": it.name,
             "notes": it.notes,
             "favorite": it.favorite,
             "folderId": it.folder_id,
+            "reprompt": it.reprompt,
             "fields": fields,
             "login": {
                 "username": login.username,
@@ -433,13 +511,31 @@ impl BwClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     /// Minimal canned-response HTTP stub. Serves `handlers` in order, one
     /// connection per request; asserts each request line starts with the
     /// expected prefix.
-    fn stub_server(handlers: Vec<(String, u16, String)>) -> String {
+    pub(crate) fn stub_server(handlers: Vec<(String, u16, String)>) -> String {
+        stub_server_inner(handlers, None)
+    }
+
+    /// Like [`stub_server`], but also records each request's request line
+    /// and body, so tests can assert on the exact PUT/POST payload.
+    pub(crate) fn stub_server_capturing(
+        handlers: Vec<(String, u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let base = stub_server_inner(handlers, Some(captured.clone()));
+        (base, captured)
+    }
+
+    fn stub_server_inner(
+        handlers: Vec<(String, u16, String)>,
+        captured: Option<Arc<Mutex<Vec<(String, Vec<u8>)>>>>,
+    ) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -458,12 +554,36 @@ mod tests {
                         break;
                     }
                 }
-                let req = String::from_utf8_lossy(&req);
-                let line = req.lines().next().unwrap_or("");
+                // Consume the body too, so capturing sees full PUT/POST
+                // payloads.
+                let header_end = req
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(req.len());
+                let mut content_length = 0usize;
+                for line in String::from_utf8_lossy(&req[..header_end]).lines().skip(1) {
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body_bytes = req[header_end..].to_vec();
+                while body_bytes.len() < content_length {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    body_bytes.extend_from_slice(&buf[..n]);
+                }
+                let req_str = String::from_utf8_lossy(&req);
+                let line = req_str.lines().next().unwrap_or("").to_string();
                 assert!(
                     line.starts_with(prefix.as_str()),
                     "unexpected request line: {line}"
                 );
+                if let Some(c) = &captured {
+                    c.lock().unwrap().push((line, body_bytes));
+                }
                 let reason = if status == 200 { "OK" } else { "Error" };
                 let resp = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -475,12 +595,13 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn item_json(rev: &str) -> String {
+    pub(crate) fn item_json(rev: &str) -> String {
         serde_json::json!({
             "success": true,
             "data": {
                 "id": "bw-1", "name": "t", "notes": null, "favorite": false,
-                "folderId": null, "login": null, "fields": [],
+                "folderId": null, "type": 1, "reprompt": 0,
+                "login": null, "fields": [],
                 "revisionDate": rev, "deletedDate": null
             }
         })
@@ -558,11 +679,58 @@ mod tests {
             totp: None,
             custom: vec![],
             group_path: "".into(),
-            last_modified_ms: 0,
             deleted: false,
         };
         let err = bw.edit_item("bw-1", &entry, None, "r1").unwrap_err();
         assert!(err.to_string().contains("500"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn stamp_item_echoes_type_reprompt_match_and_stamps() {
+        // The PUT must carry the stamps plus the echoed type/reprompt/match
+        // (replace semantics); content must otherwise be untouched.
+        let item = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": "bw-1", "name": "t", "notes": "n", "favorite": true,
+                "folderId": null, "type": 1, "reprompt": 1,
+                "login": {
+                    "username": "u", "password": "p", "totp": null,
+                    "uris": [{"uri": "https://example.com", "match": 2}]
+                },
+                "fields": [{"name": "API key", "value": "abc", "type": 0}],
+                "revisionDate": "r1", "deletedDate": null
+            }
+        })
+        .to_string();
+        let (base, captured) = stub_server_capturing(vec![
+            ("GET /object/item/bw-1 ".into(), 200, item.clone()),
+            ("PUT /object/item/bw-1 ".into(), 200, r#"{"success":true}"#.into()),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        bw.stamp_item("bw-1", &uuid::Uuid::nil(), "deadbeef").unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let put = serde_json::from_slice::<serde_json::Value>(&captured[1].1).unwrap();
+        // Echoed policy/type fields.
+        assert_eq!(put["type"], 1);
+        assert_eq!(put["reprompt"], 1);
+        assert_eq!(put["login"]["uris"][0]["match"], 2);
+        // Stamps appended; existing content intact.
+        let names: Vec<&str> = put["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"API key"));
+        assert!(names.contains(&"KBS_SYNC_ID"));
+        assert!(names.contains(&"KBS_SYNC_HASH"));
+        assert_eq!(put["login"]["username"], "u");
+        assert_eq!(put["login"]["password"], "p");
+        assert_eq!(put["notes"], "n");
+        assert_eq!(put["favorite"], true);
     }
 
     #[test]

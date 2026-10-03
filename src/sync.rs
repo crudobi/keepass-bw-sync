@@ -20,7 +20,6 @@ use crate::bw::{BwClient, BwFolder, BwItem, TrashOutcome};
 use crate::canonical::CanonicalEntry;
 use crate::journal::{Journal, JournalOp};
 use crate::kdbx::{bw_adopt_entry, KdbxVault};
-use crate::secret::Secret;
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncOpts {
@@ -59,6 +58,18 @@ pub struct QuarantineCase {
     pub bw_id: Option<String>,
     pub title: String,
     pub detail: String,
+}
+
+impl From<&QuarantineCase> for JournalOp {
+    fn from(q: &QuarantineCase) -> Self {
+        JournalOp::Quarantine {
+            kind: q.kind,
+            kp_uuid: q.kp_uuid,
+            bw_id: q.bw_id.clone(),
+            title: q.title.clone(),
+            detail: q.detail.clone(),
+        }
+    }
 }
 
 pub struct Plan {
@@ -106,7 +117,7 @@ pub fn plan(
     if bw_items.is_empty() {
         if !live_ids.is_empty() {
             anyhow::bail!(
-                "refusing to sync: Bitwarden listed 0 items but the journal holds {} live mappings (probable sync failure); no changes made",
+                "refusing to sync: Bitwarden listed 0 items but the journal holds {} live mappings (probable sync failure); no changes made. If you genuinely deleted everything server-side, run `keepass-bw-sync journal reset --journal <path>`",
                 live_ids.len()
             );
         }
@@ -115,19 +126,38 @@ pub fn plan(
         let missing = live_ids.iter().filter(|id| !present.contains(id.as_str())).count();
         if !live_ids.is_empty() && missing * 2 > live_ids.len() {
             anyhow::bail!(
-                "refusing to sync: Bitwarden listing is missing {}/{} mapped items (probable partial listing); no changes made",
+                "refusing to sync: Bitwarden listing is missing {}/{} mapped items (probable partial listing); no changes made. If you genuinely deleted most of your vault server-side, run `keepass-bw-sync journal reset --journal <path>`",
                 missing,
                 live_ids.len()
             );
         }
     }
 
-    // Adopt stamped-but-unmapped items into the journal first (identity lives
-    // in the custom field, so any host can rebuild the map).
+    // Rebuild journal mappings from stamps (identity lives in the custom
+    // field, so any host can rebuild the map). A stamp whose UUID matches no
+    // KeePass entry is an orphan — most likely an interrupted adopt whose
+    // KeePass entry was never written. Upserting a mapping for it would mint
+    // a phantom identity (the pair would then compare hashes against a
+    // non-existent entry and TrashBw its Bitwarden item); quarantine it for
+    // human re-adopt instead. Stamps that ride a KeePass tombstone keep
+    // their mapping: that is the delete-propagation path, not an orphan.
     for it in bw_items {
         if let Some(u) = stamp_uuid(it) {
             if journal.mapping_by_kp(&u)?.is_none() {
-                journal.upsert_mapping(&u, &it.id, &it.content_hash_hex())?;
+                let kp_has = kp_by_uuid.contains_key(&u)
+                    || kp_tombstones.contains(&u)
+                    || journal.tombstoned(&u)?;
+                if kp_has {
+                    journal.upsert_mapping(&u, &it.id, &it.content_hash_hex())?;
+                } else {
+                    actions.push(Action::Quarantine(QuarantineCase {
+                        kind: "orphan_bw_stamp",
+                        kp_uuid: Some(u),
+                        bw_id: Some(it.id.clone()),
+                        title: it.name.clone(),
+                        detail: "Bitwarden item carries a sync stamp for a KeePass entry that does not exist (interrupted adopt?); not adopting a phantom mapping. Remove the KBS_SYNC_ID/KBS_SYNC_HASH fields to re-adopt, or resolve if intentional".into(),
+                    }));
+                }
             }
         }
     }
@@ -275,11 +305,27 @@ pub fn plan(
     }
 
     // Unmapped, unstamped, live Bitwarden items: new on the BW side.
+    // Only type-1 (login) items are adopted: KeePass has no card/identity
+    // model, and silently reshaping a secure note into a login-shaped entry
+    // would corrupt the user's data. Other types quarantine for human review.
     for (idx, it) in bw_items.iter().enumerate() {
         if it.trashed() || stamp_uuid(it).is_some() {
             continue;
         }
         if journal.mapping_by_bw(&it.id)?.is_some() {
+            continue;
+        }
+        if it.item_type != 1 {
+            actions.push(Action::Quarantine(QuarantineCase {
+                kind: "unsupported_bw_type",
+                kp_uuid: None,
+                bw_id: Some(it.id.clone()),
+                title: it.name.clone(),
+                detail: format!(
+                    "Bitwarden item is type {} (not a login); refusing to adopt into a login-shaped KeePass entry. Item left untouched",
+                    it.item_type
+                ),
+            }));
             continue;
         }
         if opts.adopt {
@@ -323,11 +369,8 @@ pub fn apply(
     bw_items: &[BwItem],
     bw: &BwClient,
     vault: &mut KdbxVault,
-    folder_ids: &mut HashMap<String, String>,
     folders: &[BwFolder],
-    opts: &SyncOpts,
 ) -> Result<(ApplyReport, Vec<JournalOp>)> {
-    let _ = opts;
     let mut folder_cache: HashMap<String, String> = folders
         .iter()
         .map(|f| (f.name.clone(), f.id.clone()))
@@ -344,7 +387,6 @@ pub fn apply(
         }
         let id = bw.create_folder(path)?;
         folder_cache.insert(path.to_string(), id.clone());
-        folder_ids.insert(path.to_string(), id.clone());
         Ok(Some(id))
     };
 
@@ -398,13 +440,13 @@ pub fn apply(
                             .find(|e| e.uuid == *kp_uuid)
                             .map(|e| e.title.clone())
                             .unwrap_or_else(|| bw_id.clone());
-                        journal_ops.push(JournalOp::Quarantine {
+                        journal_ops.push(JournalOp::from(&QuarantineCase {
                             kind: "bw_revision_changed",
                             kp_uuid: Some(*kp_uuid),
                             bw_id: Some(bw_id.clone()),
                             title,
                             detail: "Bitwarden item changed between plan and apply; trash skipped pending review".into(),
-                        });
+                        }));
                         report.quarantined += 1;
                     }
                 }
@@ -464,13 +506,7 @@ pub fn apply(
                 }
             }
             Action::Quarantine(q) => {
-                journal_ops.push(JournalOp::Quarantine {
-                    kind: q.kind,
-                    kp_uuid: q.kp_uuid,
-                    bw_id: q.bw_id.clone(),
-                    title: q.title.clone(),
-                    detail: q.detail.clone(),
-                });
+                journal_ops.push(JournalOp::from(q));
                 report.quarantined += 1;
             }
         }
@@ -521,12 +557,6 @@ fn apply_bw_to_entry(
     entry.last_modification_time = DateInstant::now();
 }
 
-/// Build a [`Secret`] for tests without touching real credentials.
-#[doc(hidden)]
-pub fn test_secret(s: &str) -> Secret {
-    Secret::from_str(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,7 +575,6 @@ mod tests {
             totp: None,
             custom: vec![],
             group_path: "".into(),
-            last_modified_ms: 0,
             deleted: false,
         }
     }
@@ -577,6 +606,8 @@ mod tests {
             fields,
             revision_date: rev.into(),
             deleted_date: None,
+            item_type: 1,
+            reprompt: None,
         }
     }
 
@@ -768,8 +799,7 @@ mod tests {
         };
         let bw = BwClient::new("http://127.0.0.1:1").unwrap();
         let mut vault = crate::kdbx::test_vault();
-        let mut folder_ids = HashMap::new();
-        let r = apply(&p, &kp, &[], &bw, &mut vault, &mut folder_ids, &[], &SyncOpts::default());
+        let r = apply(&p, &kp, &[], &bw, &mut vault, &[]);
         assert!(r.is_err(), "expected apply to fail on the dead URL");
         assert!(
             j.list_quarantine().unwrap().is_empty(),
@@ -793,10 +823,7 @@ mod tests {
         };
         let bw = BwClient::new("http://127.0.0.1:1").unwrap();
         let mut vault = crate::kdbx::test_vault();
-        let mut folder_ids = HashMap::new();
-        let (report, ops) =
-            apply(&p, &kp, &[], &bw, &mut vault, &mut folder_ids, &[], &SyncOpts::default())
-                .unwrap();
+        let (report, ops) = apply(&p, &kp, &[], &bw, &mut vault, &[]).unwrap();
         assert_eq!(report.quarantined, 1);
         assert_eq!(ops.len(), 1);
         assert!(
@@ -805,5 +832,117 @@ mod tests {
         );
         j.apply_ops(&ops).unwrap();
         assert_eq!(j.list_quarantine().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn adopt_quarantines_non_login_types() {
+        // A secure note must never be reshaped into a login-shaped KeePass
+        // entry: it quarantines for human review, item untouched.
+        let j = mem_journal();
+        let mut note = bw_item("bw-9", None, "r1");
+        note.item_type = 2; // secure note
+        let opts = SyncOpts {
+            adopt: true,
+            ..Default::default()
+        };
+        let p = plan(&[], &HashSet::new(), &[note], &j, &opts).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "unsupported_bw_type"));
+    }
+
+    #[test]
+    fn orphan_bw_stamp_quarantines_instead_of_mapping_phantom() {
+        // Stamped, unmapped, but the KeePass entry does not exist (interrupted
+        // adopt): upserting a mapping would mint a phantom identity, so the
+        // item quarantines for human re-adopt instead.
+        let j = mem_journal();
+        let orphan = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        let p = plan(&[], &HashSet::new(), &[orphan], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "orphan_bw_stamp"));
+        assert_eq!(
+            j.live_mapping_count().unwrap(),
+            0,
+            "no phantom mapping may be rebuilt"
+        );
+    }
+
+    #[test]
+    fn stamped_item_with_kp_entry_rebuilds_mapping() {
+        // Positive control for the orphan gate: when the stamped UUID matches
+        // a real KeePass entry, the mapping is rebuilt and the in-sync pair
+        // is a no-op.
+        let j = mem_journal();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let bi = bw_item("bw-9", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        let p = plan(&kp, &HashSet::new(), &[bi], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            p.actions.is_empty(),
+            "rebuilt in-sync pair must be a no-op, got {} actions",
+            p.actions.len()
+        );
+        assert_eq!(
+            j.mapping_by_kp(&kp[0].uuid)
+                .unwrap()
+                .map(|(id, _hash)| id)
+                .as_deref(),
+            Some("bw-9")
+        );
+    }
+
+    #[test]
+    fn apply_quarantines_on_revision_change_inside_apply() {
+        // TrashBw's revision guard lives inside apply(): the plan saw r1 but
+        // the re-read at apply time sees r2 — the item changed under us, so
+        // the trash is skipped and the case quarantines for human review.
+        let revved = crate::bw::tests::item_json("r2");
+        let base = crate::bw::tests::stub_server(vec![(
+            "GET /object/item/bw-1 ".into(),
+            200,
+            revved,
+        )]);
+        let bw = BwClient::new(&base).unwrap();
+        let p = Plan {
+            actions: vec![Action::TrashBw {
+                bw_id: "bw-1".into(),
+                kp_uuid: uuid::Uuid::nil(),
+                expected_revision: "r1".into(),
+            }],
+        };
+        let mut vault = crate::kdbx::test_vault();
+        let (report, ops) = apply(&p, &[], &[], &bw, &mut vault, &[]).unwrap();
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.trashed, 0);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            crate::journal::JournalOp::Quarantine { kind, .. } if *kind == "bw_revision_changed"
+        ));
+    }
+
+    #[test]
+    fn writeback_marks_custom_fields_protected() {
+        // Foreign content applied into KeePass must land in protected
+        // custom fields, never plaintext.
+        use keepass_rs::model::core::node::NodeId;
+        use keepass_rs::model::entry::Entry;
+        let mut e = Entry::new(NodeId::new_uuid());
+        let mut bi = bw_item("bw-1", None, "r1");
+        bi.fields = vec![crate::bw::BwField {
+            name: "API key".into(),
+            value: "abc".into(),
+        }];
+        bi.login.as_mut().unwrap().totp = Some("totpseed".into());
+        apply_bw_to_entry(&mut e, &bi);
+        assert!(
+            !e.custom_fields.is_empty(),
+            "writeback must copy custom fields"
+        );
+        assert!(
+            e.custom_fields.iter().all(|f| f.is_protected),
+            "writeback custom fields must be protected"
+        );
+        assert!(e.custom_fields.iter().any(|f| f.name == "API key"));
+        assert!(e.custom_fields.iter().any(|f| f.name == "totp"));
     }
 }

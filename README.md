@@ -60,6 +60,21 @@ keepass-bw-sync quarantine --journal /path/to/sync.db
 
 Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
 
+## Recovering from the listing guard
+
+A sync refuses to run when the Bitwarden listing looks wrong (empty or
+missing most mapped items) — that pattern is usually a `bw serve` hiccup,
+not a real delete. If you genuinely deleted most of your vault server-side,
+reset the journal; the next sync rebuilds every mapping from the
+`KBS_SYNC_ID` stamps:
+
+```sh
+keepass-bw-sync journal reset --journal /path/to/sync.db
+```
+
+The old journal is archived to `sync.bak-<unix-timestamp>` (quarantine
+history and tombstones preserved for forensics).
+
 ## Layout
 
 - `src/secret.rs` — zeroized secret newtype

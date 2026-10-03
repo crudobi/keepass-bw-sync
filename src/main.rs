@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -51,6 +50,11 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<QuarantineCmd>,
     },
+    /// Manage the sync journal.
+    Journal {
+        #[command(subcommand)]
+        action: JournalCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -60,6 +64,36 @@ enum QuarantineCmd {
         /// Row id from the quarantine listing.
         id: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum JournalCmd {
+    /// Archive the current journal to a timestamped backup and start fresh.
+    /// This is the escape hatch the listing guard's bail message points at:
+    /// after a genuine mass Bitwarden delete, reset here and the next sync
+    /// rebuilds every mapping from the KBS_SYNC_ID stamps. The backup keeps
+    /// quarantine history and tombstones for forensics.
+    Reset {
+        /// Path to the SQLite sync journal.
+        #[arg(long)]
+        journal: PathBuf,
+    },
+}
+
+/// Exclusive advisory lock on `<journal>.lock`, held for the whole run.
+/// Concurrent runs share one `.kdbx.tmp` path and would diverge the journal.
+fn acquire_journal_lock(journal: &std::path::Path) -> Result<std::fs::File> {
+    let lock_path = {
+        let mut p = journal.as_os_str().to_owned();
+        p.push(".lock");
+        PathBuf::from(p)
+    };
+    let lock_file = std::fs::File::create(&lock_path)
+        .with_context(|| format!("create lock {}", lock_path.display()))?;
+    lock_file.try_lock_exclusive().context(
+        "another sync run holds the journal lock; refusing to run concurrently",
+    )?;
+    Ok(lock_file)
 }
 
 fn master_password() -> Result<Secret> {
@@ -88,16 +122,7 @@ fn main() -> Result<()> {
             // Single-writer: an exclusive flock on <journal>.lock for the
             // whole run. Fail closed when another sync holds it — concurrent
             // runs share one .kdbx.tmp path and would diverge the journal.
-            let lock_path = {
-                let mut p = journal.clone().into_os_string();
-                p.push(".lock");
-                PathBuf::from(p)
-            };
-            let lock_file = std::fs::File::create(&lock_path)
-                .with_context(|| format!("create lock {}", lock_path.display()))?;
-            lock_file.try_lock_exclusive().context(
-                "another sync run holds the journal lock; refusing to run concurrently",
-            )?;
+            let _lock = acquire_journal_lock(&journal)?;
 
             let opts = SyncOpts {
                 writeback,
@@ -114,7 +139,9 @@ fn main() -> Result<()> {
             bw.sync()
                 .context("bw sync failed — is `bw serve` running and unlocked?")?;
             let items = bw.list_items()?;
-            let folders = bw.list_folders().unwrap_or_default();
+            // Fail closed: a transient folder-list failure must not silently
+            // duplicate server folders (the CreateBw path creates them).
+            let folders = bw.list_folders().context("list bitwarden folders")?;
             let journal = Journal::open(&journal)?;
 
             let plan = plan(&entries, &tombstones, &items, &journal, &opts)?;
@@ -124,17 +151,8 @@ fn main() -> Result<()> {
                 entries.len(),
                 items.len()
             );
-            let mut folder_ids = HashMap::new();
-            let (report, journal_ops) = apply(
-                &plan,
-                &entries,
-                &items,
-                &bw,
-                &mut vault,
-                &mut folder_ids,
-                &folders,
-                &opts,
-            )?;
+            let (report, journal_ops) =
+                apply(&plan, &entries, &items, &bw, &mut vault, &folders)?;
             println!(
                 "created={} updated={} trashed={} kp_recycled={} kp_adopted={} writeback={} quarantined={}",
                 report.created,
@@ -180,6 +198,30 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Journal { action } => match action {
+            JournalCmd::Reset { journal } => {
+                // Take the lock first: resetting while a sync holds it
+                // would orphan that run's mappings.
+                let _lock = acquire_journal_lock(&journal)?;
+                if journal.exists() {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .context("system clock before epoch")?
+                        .as_secs();
+                    let backup = journal.with_extension(format!("bak-{ts}"));
+                    std::fs::rename(&journal, &backup).with_context(|| {
+                        format!(
+                            "archive journal {} to {}",
+                            journal.display(),
+                            backup.display()
+                        )
+                    })?;
+                    println!("archived journal to {}", backup.display());
+                }
+                Journal::open(&journal)?;
+                println!("created fresh journal at {}", journal.display());
+            }
+        },
     }
     Ok(())
 }
