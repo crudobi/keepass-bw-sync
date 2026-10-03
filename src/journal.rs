@@ -114,6 +114,17 @@ impl Journal {
         Ok(n > 0)
     }
 
+    /// Mappings not covered by a tombstone: the only ones whose Bitwarden
+    /// item going missing from a listing counts as a delete.
+    pub fn live_mapping_count(&self) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM mapping m WHERE NOT EXISTS (SELECT 1 FROM tombstone t WHERE t.kp_uuid = m.kp_uuid)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn quarantine(
         &self,
         kind: &str,

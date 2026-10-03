@@ -81,6 +81,17 @@ pub fn plan(
         .map(|(i, it)| (it.id.as_str(), i))
         .collect();
 
+    // Fail-closed: an empty Bitwarden listing while the journal holds live
+    // mappings is almost certainly a sync failure, not "the user deleted
+    // everything" (2026-10-03: this once recycled a whole test database).
+    // Refuse instead; a genuine mass Bitwarden delete needs an explicit
+    // journal reset.
+    if bw_items.is_empty() && journal.live_mapping_count()? > 0 {
+        anyhow::bail!(
+            "refusing to sync: Bitwarden listed 0 items but the journal holds live mappings (probable sync failure); no changes made"
+        );
+    }
+
     // Adopt stamped-but-unmapped items into the journal first (identity lives
     // in the custom field, so any host can rebuild the map).
     for it in bw_items {
@@ -316,6 +327,9 @@ pub fn apply(
                 report.trashed += 1;
             }
             Action::RecycleKp { kp_uuid, bw_id } => {
+                eprintln!(
+                    "warning: Bitwarden item {bw_id} missing from listing; moving KeePass entry to recycle bin (recoverable)"
+                );
                 let nid = keepass_rs::model::core::node::NodeId::from_uuid(*kp_uuid);
                 if vault.db.remove_entry(&nid, true).is_some() {
                     journal.record_tombstone(kp_uuid, Some(bw_id), "bitwarden")?;
@@ -548,5 +562,18 @@ mod tests {
         // BW item gone entirely; tombstone exists -> no action (no resurrect)
         let p = plan(&kp, &HashSet::new(), &[], &j, &SyncOpts::default()).unwrap();
         assert!(p.actions.is_empty());
+    }
+
+    #[test]
+    fn empty_bw_list_with_live_mappings_bails() {
+        // Regression (2026-10-03): a transient empty listing once recycled a
+        // whole test database. Fail closed instead of treating it as a
+        // mass Bitwarden delete.
+        let j = mem_journal();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let h = kp[0].content_hash_hex();
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
+        let r = plan(&kp, &HashSet::new(), &[], &j, &SyncOpts::default());
+        assert!(r.is_err(), "expected plan to bail on empty listing with live mappings");
     }
 }
