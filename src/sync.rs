@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use crate::bw::{BwClient, BwFolder, BwItem, BwLogin};
+use crate::bw::{BwClient, BwFolder, BwItem};
 use crate::canonical::CanonicalEntry;
 use crate::journal::Journal;
 use crate::kdbx::{bw_adopt_entry, KdbxVault};
@@ -410,6 +410,7 @@ pub fn test_secret(s: &str) -> Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bw::BwLogin;
     use crate::canonical::CanonicalEntry;
     use crate::secret::Secret;
 
