@@ -1,5 +1,11 @@
+# ============================================================================
+# No machine-specific values here: hourly sync, persistent across reboots,
+# start randomized by up to 10 minutes to avoid thundering herds.
+# Enable with: sudo systemctl enable --now kbs-sync.timer
+# (after working through kbs-sync.service's EDIT markers for your machine)
+# ============================================================================
 [Unit]
-Description=Hourly KeePass2 <-> Bitwarden sync (dev-loop secrets)
+Description=Hourly KeePass2 <-> Bitwarden sync
 
 [Timer]
 OnCalendar=hourly

@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
-# Supervised `bw serve` for the dev-loop secrets sync.
+# ----------------------------------------------------------------------------
+# EDIT FOR YOUR MACHINE:
+#   BW=/usr/local/bin/bw   -> path to YOUR Bitwarden CLI binary
+# Credentials come from the environment (see bw-serve.service's EDIT markers).
+# ----------------------------------------------------------------------------
+# Supervised `bw serve` for keepass-bw-sync.
 # Credentials come from EnvironmentFile=/store/muscle/secrets/bw.env (0600):
 #   BW_PASSWORD                    master password (vault unlock/decrypt)
 #   BW_CLIENTID / BW_CLIENTSECRET  API key for headless (re-)login

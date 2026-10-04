@@ -1,5 +1,15 @@
+# ============================================================================
+# EDIT FOR YOUR MACHINE -- this unit ships with the author's values.
+# Change these before enabling:
+#   User=crudobi                                  -> your Linux username
+#   EnvironmentFile=-/store/muscle/secrets/bw.env -> path to YOUR env file
+#                                                   (0600) with BW_PASSWORD and/or
+#                                                   BW_CLIENTID / BW_CLIENTSECRET
+#   ExecStart=/usr/local/bin/bw-serve.sh          -> path where you installed bw-serve.sh
+# See README.md "Deployment example" for the full setup.
+# ============================================================================
 [Unit]
-Description=Bitwarden CLI serve API (dev-loop secrets sync)
+Description=Bitwarden CLI serve API (keepass-bw-sync)
 After=network-online.target
 Wants=network-online.target
 

@@ -1,7 +1,27 @@
 # keepass-bw-sync
 
 Bidirectional KeePass2 ↔ Bitwarden sync engine in Rust. The local `.kdbx`
-on this box is the **source of truth**; the Bitwarden vault syncs to it.
+is the **source of truth**; the Bitwarden vault is the encrypted offsite copy.
+
+## Prerequisites
+
+- **Bitwarden CLI** `bw` on `PATH` (tested with `bw` 2026.9.1) plus a
+  Bitwarden account. The engine talks to `bw serve`'s local HTTP API; it
+  never contacts bitwarden.com directly.
+- **Rust** stable toolchain (`cargo`, `rustc`).
+- Linux for the `deploy/systemd/` units (optional — the binary itself is
+  portable).
+
+## Install
+
+```sh
+cargo build --release
+# or: cargo install --path .
+```
+
+Put the release binary on `PATH` (e.g. `/usr/local/bin/keepass-bw-sync`),
+then run an unlocked `bw serve` on loopback and point `sync` at your vault
+and journal — see [Deployment example](#deployment-example).
 
 ## Threat model (honest)
 
@@ -75,15 +95,18 @@ keepass-bw-sync journal reset --journal /path/to/sync.db
 The old journal is archived to `sync.bak-<unix-timestamp>` (quarantine
 history and tombstones preserved for forensics).
 
-## Dev-loop secrets integration (phase 1)
+## Deployment example
 
-The local `.kdbx` is the source of truth for machine secrets; Bitwarden is
-the encrypted offsite copy ("survival offsite"). Workers consume secrets
+One proven layout: the local `.kdbx` is the source of truth for machine
+secrets; Bitwarden is the encrypted offsite copy. Consumers read secrets
 with `get` — they never need the sync journal or Bitwarden access.
+
+The examples below use `$SECRETS_DIR` for the directory holding your vault
+files (keep the files 0600 inside a 0700 directory).
 
 ```sh
 # print one field to stdout with no trailing newline (script-safe):
-keepass-bw-sync get --kdbx /store/muscle/secrets/vault.kdbx \
+keepass-bw-sync get --kdbx "$SECRETS_DIR/vault.kdbx" \
   --title "Deploy Key" --field password
 # field: password (default) | username | url | totp | notes | <custom name>
 ```
@@ -122,21 +145,24 @@ root-group entries print as bare titles; recycle-bin entries are excluded.
 `list` touches the sync journal or Bitwarden — but `put` takes no lock,
 so don't run it concurrently with the hourly `kbs-sync` run.
 
-### Layout on waflurgiooh
+### Files
 
-- `/store/muscle/secrets/vault.kdbx` — production vault (0600)
-- `/store/muscle/secrets/vault.env` — `KBS_MASTER_PASSWORD=...` (0600, never printed)
-- `/store/muscle/secrets/sync.db` — sync journal (created on first sync)
-- `/store/muscle/secrets/bw.env` — `BW_PASSWORD=...` (0600) — DOES NOT EXIST YET
+- `$SECRETS_DIR/vault.kdbx` — the vault (0600)
+- `$SECRETS_DIR/vault.env` — `KBS_MASTER_PASSWORD=<redacted>
+- `$SECRETS_DIR/sync.db` — sync journal (created on first sync)
+- `$SECRETS_DIR/bw.env` — `BW_PASSWORD=<redacted>
 
-### systemd units (installed, NOT enabled)
+(The author's machine uses `/store/muscle/secrets` for `$SECRETS_DIR`.)
 
-`deploy/systemd/` holds the unit sources. They are installed to
+### systemd units
+
+`deploy/systemd/` holds the unit sources. Install them to
 `/etc/systemd/system/` and `/usr/local/bin/` (`systemd-analyze verify`
-clean) but deliberately left disabled — the Bitwarden account is not
-hardened yet (see checklist).
+clean), then work through the `# EDIT:` markers at the top of each file for
+your username and paths. Leave them disabled until the Bitwarden account is
+hardened (see checklist).
 
-- `bw-serve.service` — supervised `bw serve` via `/usr/local/bin/bw-serve.sh`
+- `bw-serve.service` — supervised `bw serve` via `bw-serve.sh`
   (`Restart=always`; fails closed when `BW_PASSWORD` is unset; the
   `EnvironmentFile=-...` is optional until the account is hardened).
 - `kbs-sync.service` — oneshot sync with default safe flags
@@ -144,14 +170,11 @@ hardened yet (see checklist).
   quarantine for human review). `Requires=bw-serve.service`.
 - `kbs-sync.timer` — hourly, `Persistent=true`, `RandomizedDelaySec=600`.
 
-The release binary is installed at `/usr/local/bin/keepass-bw-sync`.
-
 ### Account-hardening checklist (unblocks enabling the timer)
 
-1. Rotate the Bitwarden master password (the test password is compromised —
-   it appeared in a chat transcript).
+1. Rotate the Bitwarden master password if it was ever exposed.
 2. Enable 2FA on the Bitwarden account.
-3. Create `/store/muscle/secrets/bw.env` (0600) with `BW_PASSWORD=...`
+3. Create `$SECRETS_DIR/bw.env` (0600) with `BW_PASSWORD=...`
    (or `BW_CLIENTID` / `BW_CLIENTSECRET` for API-key login, which bypasses
    2FA for headless use).
 4. `sudo systemctl enable --now bw-serve.service kbs-sync.timer`
@@ -166,10 +189,24 @@ The release binary is installed at `/usr/local/bin/keepass-bw-sync`.
 `KBS_MASTER_PASSWORD` from the environment and fails closed when unset:
 
 ```sh
-set -a; source /store/muscle/secrets/vault.env; set +a
-cargo run --offline --example mkvault -- /store/muscle/secrets/vault.kdbx
-chmod 600 /store/muscle/secrets/vault.kdbx
+set -a; source "$SECRETS_DIR/vault.env"; set +a
+cargo run --offline --example mkvault -- "$SECRETS_DIR/vault.kdbx"
+chmod 600 "$SECRETS_DIR/vault.kdbx"
 ```
+
+## Limitations
+
+- **No attachment sync** (see Roadmap): large secrets such as SSH private
+  keys are stored as text in notes fields. It works, but it is clunky for
+  many or large files.
+- **`put` takes no lock**: do not run `put` concurrently with a scheduled
+  `kbs-sync` run. A sync that overlaps a `put` may miss the new entry until
+  the next run (saves are atomic, so nothing corrupts).
+- **`bw serve` is loopback-only plaintext HTTP by design.**
+  `--insecure-remote-url` exists for exotic setups, but a remote URL
+  exfiltrates vault secrets — only ever point it at hosts you fully trust.
+- The `deploy/systemd/` units are Linux-specific; the Rust binary itself is
+  portable.
 
 ## Layout
 

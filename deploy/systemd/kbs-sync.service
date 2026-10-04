@@ -1,5 +1,17 @@
+# ============================================================================
+# EDIT FOR YOUR MACHINE -- this unit ships with the author's values.
+# Change these before enabling:
+#   User=crudobi                                    -> your Linux username
+#   EnvironmentFile=/store/muscle/secrets/vault.env -> path to YOUR env file
+#                                                     (0600) with KBS_MASTER_PASSWORD
+#   ExecStart=... --kdbx /store/muscle/secrets/vault.kdbx
+#                    --journal /store/muscle/secrets/sync.db
+#                                                   -> YOUR vault and journal paths
+#   /usr/local/bin/keepass-bw-sync                  -> path where you installed the binary
+# See README.md "Deployment example" for the full setup.
+# ============================================================================
 [Unit]
-Description=KeePass2 <-> Bitwarden sync (dev-loop secrets, offsite backup)
+Description=KeePass2 <-> Bitwarden sync (offsite backup)
 Requires=bw-serve.service
 After=bw-serve.service
 

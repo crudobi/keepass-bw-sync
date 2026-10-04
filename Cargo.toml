@@ -3,6 +3,10 @@ name = "keepass-bw-sync"
 version = "0.1.0"
 edition = "2021"
 description = "Bidirectional KeePass2 <-> Bitwarden sync engine. Local .kdbx is the source of truth."
+license = "MIT"
+authors = ["Crud <crudobi@proton.me>"]
+repository = "https://github.com/crudobi/keepass-bw-sync"
+keywords = ["keepass", "bitwarden", "password-manager", "sync"]
 
 [lib]
 name = "keepass_bw_sync"

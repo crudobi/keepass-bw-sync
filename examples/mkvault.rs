@@ -1,11 +1,11 @@
 //! One-off init tool: create an empty KDBX4 vault for production use.
 //!
 //! Usage: KBS_MASTER_PASSWORD must be set in the environment, then
-//!   cargo run --offline --example mkvault -- /store/muscle/secrets/vault.kdbx
+//!   cargo run --offline --example mkvault -- $SECRETS_DIR/vault.kdbx
 //!
 //! Fails closed when KBS_MASTER_PASSWORD is unset or empty; the password is
 //! zeroized after use. Documented as a one-off: the production password lives
-//! in /store/muscle/secrets/vault.env (0600, never printed, never committed).
+//! in $SECRETS_DIR/vault.env (0600, never printed, never committed).
 
 use std::fs::File;
 

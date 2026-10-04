@@ -56,10 +56,10 @@ fn main() {
     add_entry(
         &mut db,
         &email,
-        "ProtonMail",
-        "crudobi@proton.me",
-        "test-pw-proton-1",
-        "https://mail.proton.me",
+        "ExampleMail",
+        "alice@example.com",
+        "test-pw-alice-1",
+        "https://example.com",
         "e2e test entry",
     );
     add_entry(
