@@ -6,7 +6,8 @@ use fs2::FileExt;
 use keepass_bw_sync::bw::BwClient;
 use keepass_bw_sync::journal::Journal;
 use keepass_bw_sync::kdbx::{
-    extract_entries, get_entry_field, open_vault, save_vault, tombstoned_uuids,
+    extract_entries, get_entry_field, list_entries, open_vault, put_entry, read_secret_input,
+    save_vault, tombstoned_uuids, NewEntrySpec, PutOutcome,
 };
 use keepass_bw_sync::secret::Secret;
 use keepass_bw_sync::sync::{apply, plan, SyncOpts};
@@ -70,6 +71,54 @@ enum Cmd {
         /// custom-field name (case-insensitive).
         #[arg(long, default_value = "password")]
         field: String,
+    },
+    /// Write an entry into the local .kdbx (create, or replace in place
+    /// with --update). Secret material comes only from stdin or a file,
+    /// never argv (argv is visible in `ps`). Reads/writes the local .kdbx
+    /// only: no journal, no Bitwarden.
+    Put {
+        /// Path to the KeePass2 database.
+        #[arg(long)]
+        kdbx: PathBuf,
+        /// Exact entry title.
+        #[arg(long)]
+        title: String,
+        /// Group name; created as a top-level group when missing. Ignored
+        /// with --update (entries are never moved between groups).
+        #[arg(long)]
+        group: Option<String>,
+        /// Username (not secret on its own; argv is fine).
+        #[arg(long)]
+        username: Option<String>,
+        /// URL (argv is fine).
+        #[arg(long)]
+        url: Option<String>,
+        /// Read the password from stdin (must be piped, not a terminal).
+        #[arg(long)]
+        password_stdin: bool,
+        /// Read the password from a file. Exactly one trailing newline
+        /// (`\n` or `\r\n`) is trimmed.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+        /// Read notes from stdin (must be piped, not a terminal).
+        #[arg(long)]
+        notes_stdin: bool,
+        /// Read notes from a file. Exactly one trailing newline is trimmed.
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+        /// Replace the existing entry's fields in place instead of failing
+        /// on a duplicate title. Only provided fields are overwritten;
+        /// everything else is left untouched.
+        #[arg(long)]
+        update: bool,
+    },
+    /// List entry titles as `group/title` (root entries as bare `title`),
+    /// one per line, sorted. Never prints field values. Reads the local
+    /// .kdbx only: no journal, no Bitwarden.
+    List {
+        /// Path to the KeePass2 database.
+        #[arg(long)]
+        kdbx: PathBuf,
     },
 }
 
@@ -250,6 +299,53 @@ fn main() -> Result<()> {
                     .context("write field value to stdout")?;
             }
             // The returned Secret zeroizes its bytes on drop.
+        }
+        Cmd::Put {
+            kdbx,
+            title,
+            group,
+            username,
+            url,
+            password_stdin,
+            password_file,
+            notes_stdin,
+            notes_file,
+            update,
+        } => {
+            let password =
+                read_secret_input("password", password_stdin, password_file.as_deref())?;
+            let notes = read_secret_input("notes", notes_stdin, notes_file.as_deref())?;
+            let pw = master_password()?;
+            let mut vault = open_vault(&kdbx, &pw, None)?;
+            drop(pw); // master password leaves scope before mutation
+            let title_msg = title.clone();
+            let spec = NewEntrySpec {
+                title,
+                group,
+                username: username.map(|u| Secret::from_str(&u)),
+                url,
+                password,
+                notes,
+                update,
+            };
+            let outcome = put_entry(&mut vault.db, spec)?;
+            save_vault(&vault)?;
+            match outcome {
+                PutOutcome::Created => println!("created {title_msg:?}"),
+                PutOutcome::Updated => println!("updated {title_msg:?}"),
+            }
+        }
+        Cmd::List { kdbx } => {
+            let pw = master_password()?;
+            let vault = open_vault(&kdbx, &pw, None)?;
+            drop(pw); // master password leaves scope before any output
+            for (gp, t) in list_entries(&vault.db) {
+                if gp.is_empty() {
+                    println!("{t}");
+                } else {
+                    println!("{gp}/{t}");
+                }
+            }
         }
     }
     Ok(())

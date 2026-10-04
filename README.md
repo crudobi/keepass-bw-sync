@@ -91,6 +91,37 @@ keepass-bw-sync get --kdbx /store/muscle/secrets/vault.kdbx \
 Exact title match; duplicates error listing each entry's group path so you
 can disambiguate. Unknown fields error listing the available names.
 
+### Writing entries: `put`
+
+```sh
+# create (group is created when missing):
+printf '%s' "$PW" | keepass-bw-sync put --kdbx vault.kdbx \
+  --title "Deploy Key" --group "Ops" --username deploy \
+  --url https://example.com --password-stdin
+# replace the existing entry's fields in place (only provided fields change):
+printf '%s' "$NEWPW" | keepass-bw-sync put --kdbx vault.kdbx \
+  --title "Deploy Key" --password-stdin --update
+# inventory without exposing values:
+keepass-bw-sync list --kdbx vault.kdbx
+```
+
+**No-argv rule:** secret material comes only from `--password-stdin` /
+`--password-file` (and the `--notes-*` variants) — never from argv, which
+is visible in `ps`. `--*-stdin` fails closed when stdin is a terminal
+(nothing piped). `--username` / `--url` are argv-safe (not secret alone).
+
+**Trim rule:** exactly one trailing newline (`\n` or `\r\n`) is stripped
+from stdin/file input, so `echo` output and editor-saved files work as-is;
+anything beyond that is part of the secret.
+
+Duplicate titles fail closed unless `--update` (matched by exact title
+globally; `--update` never moves an entry between groups, and `--group`
+is ignored then). `list` prints one `group/title` per line, sorted;
+root-group entries print as bare titles; recycle-bin entries are excluded.
+`put` saves the database atomically after mutation. Neither `put` nor
+`list` touches the sync journal or Bitwarden — but `put` takes no lock,
+so don't run it concurrently with the hourly `kbs-sync` run.
+
 ### Layout on waflurgiooh
 
 - `/store/muscle/secrets/vault.kdbx` — production vault (0600)
