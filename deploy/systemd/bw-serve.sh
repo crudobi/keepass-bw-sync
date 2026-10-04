@@ -11,16 +11,35 @@ if [ -z "${BW_PASSWORD:-}" ]; then
     echo "bw-serve: BW_PASSWORD is not set; refusing to start (see README)" >&2
     exit 1
 fi
-if ! BW_SESSION="$("$BW" unlock --passwordenv BW_PASSWORD --raw 2>/dev/null)"; then
-    # No usable session (first boot, rotated password, stale keyring, ...):
-    # log in headless via API key, then unlock.
+
+# Unlock and print the raw session key. The SDK may print migration notices
+# to stdout alongside the key, so capture and take the last line rather
+# than trusting the whole output (a polluted BW_SESSION leaves the vault
+# locked). Returns non-zero when unlock itself fails.
+unlock() {
+    local out
+    if ! out="$("$BW" unlock --passwordenv BW_PASSWORD --raw 2>/tmp/bw-unlock.err)"; then
+        return 1
+    fi
+    printf "%s" "$out" | tail -n 1
+}
+
+if BW_SESSION="$(unlock)"; then
+    echo "bw-serve: unlocked existing session" >&2
+else
+    echo "bw-serve: no usable session; logging in via API key" >&2
     if [ -z "${BW_CLIENTID:-}" ] || [ -z "${BW_CLIENTSECRET:-}" ]; then
-        echo "bw-serve: unlock failed and BW_CLIENTID/BW_CLIENTSECRET are not set; cannot log in headless" >&2
+        echo "bw-serve: BW_CLIENTID/BW_CLIENTSECRET are not set; cannot log in headless" >&2
+        cat /tmp/bw-unlock.err >&2
         exit 1
     fi
     "$BW" logout 2>/dev/null || true
     "$BW" login --apikey >&2
-    BW_SESSION="$("$BW" unlock --passwordenv BW_PASSWORD --raw)"
+    BW_SESSION="$(unlock)" || {
+        echo "bw-serve: unlock after API-key login failed" >&2
+        cat /tmp/bw-unlock.err >&2
+        exit 1
+    }
 fi
 export BW_SESSION
 exec "$BW" serve --hostname 127.0.0.1 --port 8087
