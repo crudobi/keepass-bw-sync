@@ -9,4 +9,4 @@ if [ -z "${BW_PASSWORD:-}" ]; then
     exit 1
 fi
 export BW_SESSION="$("$BW" unlock --passwordenv BW_PASSWORD --raw)"
-exec "$BW" serve --port 8087
+exec "$BW" serve --hostname 127.0.0.1 --port 8087
