@@ -238,7 +238,12 @@ fn main() -> Result<()> {
             journal
                 .apply_ops(&journal_ops)
                 .context("commit journal ops")?;
-            if report.quarantined > 0 {
+            // `report.quarantined` counts only actions taken *this run*; the
+            // journal's authoritative pending-review count is the total
+            // unresolved rows, which must agree with the quarantine table.
+            let quarantine_pending = journal.unresolved_quarantine_count()?;
+            println!("quarantine_pending={quarantine_pending}");
+            if report.quarantined > 0 || quarantine_pending > 0 {
                 println!("review: keepass-bw-sync quarantine --journal <path>");
             }
         }

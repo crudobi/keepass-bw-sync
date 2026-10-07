@@ -238,6 +238,22 @@ impl Journal {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Total unresolved quarantine rows: the authoritative "pending review"
+    /// count. This is what the `quarantine` subcommand lists and what an
+    /// operator compares against -- unlike the per-run sync summary's
+    /// `quarantined` field, which counts only actions taken *this run* and
+    /// therefore disagrees with the table whenever an older row is still
+    /// open (e.g. an item quarantined in one run and adopted in a later
+    /// one without resolving its row).
+    pub fn unresolved_quarantine_count(&self) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM quarantine WHERE resolved = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Commit deferred [`JournalOp`]s. The caller must invoke this only after
     /// the KeePass database is durably saved: committing earlier would let
     /// the journal claim KeePass mutations that never reached disk.
@@ -331,6 +347,21 @@ mod tests {
         // Resolving twice is a no-op.
         assert!(!j.resolve_quarantine(rows[0].0).unwrap());
         assert!(!j.resolve_quarantine(9999).unwrap());
+    }
+
+    #[test]
+    fn unresolved_quarantine_count_counts_only_open_rows() {
+        let j = mem_journal();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
+        j.quarantine("k", None, Some("bw-1"), "t", "d").unwrap();
+        // Same identity while unresolved: deduped, still 1.
+        j.quarantine("k", None, Some("bw-1"), "t", "d").unwrap();
+        j.quarantine("k", None, Some("bw-2"), "t", "d").unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 2);
+        assert_eq!(j.list_quarantine().unwrap().len(), 2);
+        let rows = j.list_quarantine().unwrap();
+        assert!(j.resolve_quarantine(rows[0].0).unwrap());
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 1);
     }
 
     #[test]
