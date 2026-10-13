@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::bw::{BwClient, BwFolder, BwItem, TrashOutcome};
 use crate::canonical::CanonicalEntry;
 use crate::journal::{Journal, JournalOp};
-use crate::kdbx::{bw_adopt_entry, KdbxVault};
+use crate::kdbx::{adopt_bw_entry, recycle_entry, writeback_entry, KdbxVault};
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncOpts {
@@ -455,8 +455,7 @@ pub fn apply(
                 eprintln!(
                     "warning: Bitwarden item {bw_id} missing from listing; moving KeePass entry to recycle bin (recoverable)"
                 );
-                let nid = keepass_rs::model::core::node::NodeId::from_uuid(*kp_uuid);
-                if vault.db.remove_entry(&nid, true).is_some() {
+                if recycle_entry(&mut vault.db, *kp_uuid) {
                     journal_ops.push(JournalOp::RecordTombstone {
                         kp_uuid: *kp_uuid,
                         bw_id: Some(bw_id.clone()),
@@ -468,35 +467,22 @@ pub fn apply(
             }
             Action::AdoptBwNew { item_idx } => {
                 let it = &bw_items[*item_idx];
-                let entry = bw_adopt_entry(it);
-                let uuid = entry.id.as_uuid().cloned().unwrap_or_default();
-                let root = vault
-                    .db
-                    .root_group_id
-                    .clone()
-                    .context("no root group")?;
-                if vault.db.add_entry(entry, &root) {
-                    let hash = it.content_hash_hex();
-                    // Write the identity stamp back so the hybrid identity
-                    // holds in both directions on future runs.
-                    bw.stamp_item(&it.id, &uuid, &hash)
-                        .with_context(|| format!("stamp adopted item {}", it.id))?;
-                    journal_ops.push(JournalOp::UpsertMapping {
-                        kp_uuid: uuid,
-                        bw_id: it.id.clone(),
-                        hash,
-                    });
-                    report.kp_adopted += 1;
-                }
+                let uuid = adopt_bw_entry(&mut vault.db, it);
+                let hash = it.content_hash_hex();
+                // Write the identity stamp back so the hybrid identity
+                // holds in both directions on future runs.
+                bw.stamp_item(&it.id, &uuid, &hash)
+                    .with_context(|| format!("stamp adopted item {}", it.id))?;
+                journal_ops.push(JournalOp::UpsertMapping {
+                    kp_uuid: uuid,
+                    bw_id: it.id.clone(),
+                    hash,
+                });
+                report.kp_adopted += 1;
             }
             Action::WritebackEdit { bw_id, kp_uuid, item_idx } => {
                 let it = &bw_items[*item_idx];
-                let nid = keepass_rs::model::core::node::NodeId::from_uuid(*kp_uuid);
-                if let Some(entry) = vault.db.entries.get_mut(&nid) {
-                    // Preserve the loser in entry history before overwriting.
-                    let snapshot = entry.clone();
-                    entry.history.push(snapshot);
-                    apply_bw_to_entry(entry, it);
+                if writeback_entry(&mut vault.db, *kp_uuid, it) {
                     journal_ops.push(JournalOp::UpsertMapping {
                         kp_uuid: *kp_uuid,
                         bw_id: bw_id.clone(),
@@ -515,47 +501,8 @@ pub fn apply(
 }
 
 /// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
-fn apply_bw_to_entry(
-    entry: &mut keepass_rs::model::entry::Entry,
-    it: &BwItem,
-) {
-    use keepass_rs::model::core::security::ProtectedString as PS;
-    use keepass_rs::model::core::date::DateInstant;
-    let login = it.login.clone().unwrap_or_default();
-    entry.title = it.name.clone();
-    entry.username = PS::new_protected(login.username.as_deref().unwrap_or_default());
-    entry.password = PS::new_protected(login.password.as_deref().unwrap_or_default());
-    entry.url = login
-        .uris
-        .as_ref()
-        .and_then(|u| u.first())
-        .and_then(|u| u.uri.clone())
-        .unwrap_or_default();
-    entry.notes = PS::new_protected(it.notes.as_deref().unwrap_or_default());
-    // Replace non-stamp custom fields wholesale with the BW side's set.
-    entry.custom_fields.retain(|f| {
-        f.name == crate::stamps::SYNC_ID_FIELD || f.name == crate::stamps::SYNC_HASH_FIELD
-    });
-    for f in &it.fields {
-        if f.name == crate::stamps::SYNC_ID_FIELD || f.name == crate::stamps::SYNC_HASH_FIELD {
-            continue;
-        }
-        entry.custom_fields.push(keepass_rs::model::entry::EntryField {
-            name: f.name.clone(),
-            value: PS::new_protected(&f.value),
-            is_protected: true,
-        });
-    }
-    if let Some(t) = login.totp.filter(|s| !s.is_empty()) {
-        entry.custom_fields.retain(|f| !f.name.eq_ignore_ascii_case("totp"));
-        entry.custom_fields.push(keepass_rs::model::entry::EntryField {
-            name: "totp".to_string(),
-            value: PS::new_protected(&t),
-            is_protected: true,
-        });
-    }
-    entry.last_modification_time = DateInstant::now();
-}
+/// (Implementation moved to [`crate::kdbx::apply_bw_to_entry`] with the vault
+/// layer in the keepass 0.15 port.)
 
 #[cfg(test)]
 mod tests {
@@ -924,25 +871,37 @@ mod tests {
     fn writeback_marks_custom_fields_protected() {
         // Foreign content applied into KeePass must land in protected
         // custom fields, never plaintext.
-        use keepass_rs::model::core::node::NodeId;
-        use keepass_rs::model::entry::Entry;
-        let mut e = Entry::new(NodeId::new_uuid());
+        use keepass::db::{fields, Value};
+        let mut db = keepass::Database::new();
+        let mut root = db.root_mut();
+        let mut e = root.add_entry();
         let mut bi = bw_item("bw-1", None, "r1");
         bi.fields = vec![crate::bw::BwField {
             name: "API key".into(),
             value: "abc".into(),
         }];
         bi.login.as_mut().unwrap().totp = Some("totpseed".into());
-        apply_bw_to_entry(&mut e, &bi);
+        crate::kdbx::apply_bw_to_entry(&mut e, &bi);
+        let custom: Vec<(&String, &Value<String>)> = e
+            .fields
+            .iter()
+            .filter(|(name, _)| {
+                ![
+                    fields::TITLE,
+                    fields::USERNAME,
+                    fields::PASSWORD,
+                    fields::URL,
+                    fields::NOTES,
+                ]
+                .contains(&name.as_str())
+            })
+            .collect();
+        assert!(!custom.is_empty(), "writeback must copy custom fields");
         assert!(
-            !e.custom_fields.is_empty(),
-            "writeback must copy custom fields"
-        );
-        assert!(
-            e.custom_fields.iter().all(|f| f.is_protected),
+            custom.iter().all(|(_, v)| v.is_protected()),
             "writeback custom fields must be protected"
         );
-        assert!(e.custom_fields.iter().any(|f| f.name == "API key"));
-        assert!(e.custom_fields.iter().any(|f| f.name == "totp"));
+        assert!(custom.iter().any(|(name, _)| *name == "API key"));
+        assert!(custom.iter().any(|(name, _)| *name == "totp"));
     }
 }

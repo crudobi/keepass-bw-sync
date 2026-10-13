@@ -5,19 +5,15 @@
 //! mutations. Saves are crash-safe: build to `<name>.kdbx.tmp`, fsync, then
 //! atomic rename over the original.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use keepass_rs::model::core::node::NodeId;
-use keepass_rs::model::core::security::ProtectedString;
-use keepass_rs::model::db::composite_key::CompositeKey;
-use keepass_rs::model::db::database::Database;
-use keepass_rs::model::entry::Entry;
-use keepass_rs::model::group::Group;
-use keepass_rs::{open_database, save_database};
+use keepass::config::DatabaseVersion;
+use keepass::db::{fields, Database, Entry, EntryId, GroupId, History};
+use keepass::DatabaseKey;
 use uuid::Uuid;
 
 use crate::canonical::CanonicalEntry;
@@ -26,125 +22,149 @@ use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
 
 pub struct KdbxVault {
     pub db: Database,
-    key: CompositeKey,
+    password: Secret,
+    keyfile: Option<Vec<u8>>,
     path: PathBuf,
+}
+
+fn build_key(password: &Secret, keyfile: Option<&[u8]>) -> Result<DatabaseKey> {
+    let pw = std::str::from_utf8(password.expose()).context("master password is not UTF-8")?;
+    let mut key = DatabaseKey::new().with_password(pw);
+    if let Some(kf) = keyfile {
+        let mut slice: &[u8] = kf;
+        key = key
+            .with_keyfile(&mut slice)
+            .context("parse keyfile")?;
+    }
+    Ok(key)
 }
 
 /// Open and decrypt the .kdbx at `path`. Nothing plaintext touches disk.
 pub fn open_vault(path: &Path, password: &Secret, keyfile: Option<&[u8]>) -> Result<KdbxVault> {
-    let mut ck = CompositeKey::new().with_password(password.expose());
-    if let Some(kf) = keyfile {
-        ck = ck.with_key_file(kf);
+    let key = build_key(password, keyfile)?;
+    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut db = Database::open(&mut f, key).context("decrypt .kdbx (wrong password/keyfile?)")?;
+    // The keepass crate's writer emits KDBX 4.1 only (its dump path rejects
+    // any other version). A KDBX 4.0 database (e.g. one last written by an
+    // older KeePassXC) is therefore upgraded in memory at open: 4.1 is a
+    // strict superset, every KeePassXC >= 2.7 reads it, and the first save
+    // writes the vault back as 4.1.
+    if db.config.version == DatabaseVersion::KDB4(0) {
+        db.config.version = DatabaseVersion::KDB4(1);
     }
-    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let db = open_database(f, &ck).context("decrypt .kdbx (wrong password/keyfile?)")?;
     Ok(KdbxVault {
         db,
-        key: ck,
+        password: Secret::new(password.expose().to_vec()),
+        keyfile: keyfile.map(|k| k.to_vec()),
         path: path.to_path_buf(),
     })
 }
 
-fn ps_to_string(p: &ProtectedString) -> String {
-    p.as_str().to_string()
+/// The standard KDBX field names. Anything else in an entry's field map is a
+/// custom field.
+fn is_standard_field(name: &str) -> bool {
+    matches!(
+        name,
+        fields::TITLE | fields::USERNAME | fields::PASSWORD | fields::URL | fields::NOTES
+    )
 }
 
-fn child_to_parent(db: &Database) -> HashMap<NodeId, NodeId> {
-    let mut m = HashMap::new();
-    for (gid, g) in &db.groups {
-        for c in &g.child_group_ids {
-            m.insert(c.clone(), gid.clone());
-        }
-    }
-    m
+/// One entry found by the tree walk, with the context the old flat model
+/// used to look up separately. The entry is cloned out of the tree: the
+/// crate's `GroupRef` iterators tie child lifetimes to the parent handle,
+/// which makes a borrowed recursive walk impossible; vaults here are small
+/// and every consumer either sorts or projects the clone immediately.
+struct WalkedEntry {
+    id: EntryId,
+    entry: Entry,
+    group_path: String,
+    parent: GroupId,
 }
 
-/// "Personal/Email" style path of the group holding `entry_id`, excluding root.
-fn group_path(db: &Database, entry_id: &NodeId, c2p: &HashMap<NodeId, NodeId>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = db.find_parent_group_of_entry(entry_id);
-    let root = db.root_group_id.clone();
-    let mut guard = 0;
-    while let Some(gid) = cur {
-        guard += 1;
-        if guard > 256 {
-            break;
+/// Walk the whole group tree once (explicit stack of group ids, so every
+/// `GroupRef` is minted fresh from the database). Returns every entry (with
+/// its group path excluding the root group) and every group as
+/// (id, name, full path).
+fn walk(db: &Database) -> (Vec<WalkedEntry>, Vec<(GroupId, String, String)>) {
+    let mut entries = Vec::new();
+    let mut groups = Vec::new();
+    let mut stack: Vec<(GroupId, String)> = vec![(db.root().id(), String::new())];
+    while let Some((gid, path)) = stack.pop() {
+        let Some(group) = db.group(gid) else {
+            continue;
+        };
+        groups.push((gid, group.name.clone(), path.clone()));
+        for e in group.entries() {
+            entries.push(WalkedEntry {
+                id: e.id(),
+                entry: (*e).clone(),
+                group_path: path.clone(),
+                parent: gid,
+            });
         }
-        if Some(&gid) == root.as_ref() {
-            break;
-        }
-        match db.groups.get(&gid) {
-            Some(g) => {
-                parts.push(g.title.clone());
-                cur = c2p.get(&gid).cloned();
-            }
-            None => break,
+        for g in group.groups() {
+            let child_path = if path.is_empty() {
+                g.name.clone()
+            } else {
+                format!("{path}/{}", g.name)
+            };
+            stack.push((g.id(), child_path));
         }
     }
-    parts.reverse();
-    parts.join("/")
+    (entries, groups)
 }
 
 /// TOTP is carried as a plain custom field named "totp" (case-insensitive).
 fn extract_totp(entry: &Entry) -> Option<String> {
     entry
-        .custom_fields
+        .fields
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case("totp"))
-        .map(|f| ps_to_string(&f.value))
+        .find(|(name, _)| name.eq_ignore_ascii_case("totp"))
+        .map(|(_, v)| v.get().clone())
         .filter(|s| !s.is_empty())
 }
 
-fn entry_to_canonical(db: &Database, eid: &NodeId, entry: &Entry, c2p: &HashMap<NodeId, NodeId>) -> CanonicalEntry {
-    let uuid = entry.id.as_uuid().cloned().unwrap_or_else(Uuid::nil);
-    let recycle = db.recycle_bin_uuid.map(NodeId::from_uuid);
-    let deleted = match db.find_parent_group_of_entry(eid) {
-        Some(p) => Some(p) == recycle,
-        None => false,
-    };
+fn entry_to_canonical(db: &Database, w: &WalkedEntry) -> CanonicalEntry {
+    let entry = &w.entry;
+    let deleted = db.meta.recyclebin_uuid == Some(w.parent.uuid());
     let custom: Vec<(String, String)> = entry
-        .custom_fields
+        .fields
         .iter()
-        .filter(|f| !f.name.eq_ignore_ascii_case("totp"))
-        .map(|f| (f.name.clone(), ps_to_string(&f.value)))
+        .filter(|(name, _)| !is_standard_field(name) && !name.eq_ignore_ascii_case("totp"))
+        .map(|(name, v)| (name.clone(), v.get().clone()))
         .collect();
     CanonicalEntry {
-        uuid,
-        title: entry.title.clone(),
-        username: ps_to_string(&entry.username),
-        password: Secret::from_str(entry.password.as_str()),
-        url: entry.url.clone(),
-        notes: ps_to_string(&entry.notes),
+        uuid: w.id.uuid(),
+        title: entry.get_title().unwrap_or_default().to_string(),
+        username: entry.get_username().unwrap_or_default().to_string(),
+        password: Secret::from_str(entry.get_password().unwrap_or_default()),
+        url: entry.get_url().unwrap_or_default().to_string(),
+        notes: entry.get(fields::NOTES).unwrap_or_default().to_string(),
         totp: extract_totp(entry),
         custom,
-        group_path: group_path(db, eid, c2p),
+        group_path: w.group_path.clone(),
         deleted,
     }
 }
 
 /// Project every entry in the database into canonical form.
 pub fn extract_entries(db: &Database) -> Vec<CanonicalEntry> {
-    let c2p = child_to_parent(db);
-    db.entries
-        .iter()
-        .map(|(eid, e)| entry_to_canonical(db, eid, e, &c2p))
-        .collect()
+    let (entries, _) = walk(db);
+    entries.iter().map(|w| entry_to_canonical(db, w)).collect()
 }
 
 /// UUIDs of entries permanently deleted (KDBX tombstones).
 pub fn tombstoned_uuids(db: &Database) -> HashSet<Uuid> {
-    db.deleted_objects
-        .iter()
-        .filter_map(|n| n.as_uuid().cloned())
-        .collect()
+    db.deleted_objects.keys().cloned().collect()
 }
 
 /// Crash-safe save: write temp file, fsync, atomic rename, fsync parent dir.
 pub fn save_vault(v: &KdbxVault) -> Result<()> {
+    let key = build_key(&v.password, v.keyfile.as_deref())?;
     let tmp = v.path.with_extension("kdbx.tmp");
     {
         let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        save_database(&mut f, &v.db, &v.key).context("serialize .kdbx")?;
+        v.db.save(&mut f, key).context("serialize .kdbx")?;
         f.sync_all().context("fsync tmp")?;
     }
     std::fs::rename(&tmp, &v.path).context("atomic rename into place")?;
@@ -155,7 +175,8 @@ pub fn save_vault(v: &KdbxVault) -> Result<()> {
     Ok(())
 }
 
-/// Build a fresh entry from Bitwarden-side content (adopt path).
+/// Create a KeePass entry from Bitwarden-side content (adopt path), under the
+/// root group. Returns the new entry's UUID.
 ///
 /// Bitwarden custom fields ride along as KeePass custom fields (protected),
 /// minus the sync stamps, which the adopt arm stamps back onto the Bitwarden
@@ -163,27 +184,26 @@ pub fn save_vault(v: &KdbxVault) -> Result<()> {
 /// insensitive) is skipped when the item carries a real TOTP — KeePass
 /// represents TOTP as its own field, and the collision would double-count in
 /// [`CanonicalEntry::content_hash`].
-pub fn bw_adopt_entry(item: &crate::bw::BwItem) -> Entry {
-    use keepass_rs::model::core::security::ProtectedString as PS;
-    let mut e = Entry::new(NodeId::new_uuid());
-    e.title = item.name.clone();
+pub fn adopt_bw_entry(db: &mut Database, item: &crate::bw::BwItem) -> Uuid {
+    let mut root = db.root_mut();
+    let mut e = root.add_entry();
+    e.set_unprotected(fields::TITLE, item.name.clone());
     let login = item.login.clone().unwrap_or_default();
-    e.username = PS::new_protected(&login.username.unwrap_or_default());
-    e.password = PS::new_protected(&login.password.unwrap_or_default());
-    e.url = login
-        .uris
-        .unwrap_or_default()
-        .into_iter()
-        .find_map(|u| u.uri)
-        .unwrap_or_default();
-    e.notes = PS::new_protected(item.notes.as_deref().unwrap_or_default());
+    e.set_protected(fields::USERNAME, login.username.unwrap_or_default());
+    e.set_protected(fields::PASSWORD, login.password.unwrap_or_default());
+    e.set_unprotected(
+        fields::URL,
+        login
+            .uris
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|u| u.uri)
+            .unwrap_or_default(),
+    );
+    e.set_protected(fields::NOTES, item.notes.as_deref().unwrap_or_default());
     let totp = login.totp.clone().filter(|s| !s.is_empty());
     if let Some(t) = totp {
-        e.custom_fields.push(keepass_rs::model::entry::EntryField {
-            name: "totp".to_string(),
-            value: PS::new_protected(&t),
-            is_protected: true,
-        });
+        e.set_protected("totp", t);
     }
     // A field named "totp" collides with the real TOTP above and would
     // double-count in `CanonicalEntry::content_hash`; skip it then.
@@ -195,22 +215,99 @@ pub fn bw_adopt_entry(item: &crate::bw::BwItem) -> Entry {
         if skip_totp && f.name.eq_ignore_ascii_case("totp") {
             continue;
         }
-        e.custom_fields.push(keepass_rs::model::entry::EntryField {
-            name: f.name.clone(),
-            value: PS::new_protected(&f.value),
-            is_protected: true,
-        });
+        e.set_protected(f.name.clone(), f.value.clone());
     }
-    e
+    e.id().uuid()
+}
+
+/// Recycle one entry by UUID, mirroring the old `remove_entry(id, true)`:
+/// move it into the recycle bin when the bin exists, otherwise permanently
+/// remove it and record a KDBX tombstone. Returns false when no such entry.
+pub fn recycle_entry(db: &mut Database, uuid: Uuid) -> bool {
+    let eid = EntryId::from_uuid(uuid);
+    if db.entry(eid).is_none() {
+        return false;
+    }
+    if let Some(rb) = db.recycle_bin() {
+        let rb_id = rb.id();
+        drop(rb);
+        if let Some(mut e) = db.entry_mut(eid) {
+            return e.move_to(rb_id).is_ok();
+        }
+        return false;
+    }
+    if let Some(e) = db.entry_mut(eid) {
+        e.remove();
+        db.deleted_objects
+            .insert(uuid, Some(chrono::Utc::now().naive_utc()));
+        true
+    } else {
+        false
+    }
+}
+
+/// Apply a Bitwarden edit into the KeePass entry with this UUID (writeback
+/// path): the current state is preserved in entry history first. Returns
+/// false when no such entry exists.
+pub fn writeback_entry(db: &mut Database, uuid: Uuid, item: &crate::bw::BwItem) -> bool {
+    let eid = EntryId::from_uuid(uuid);
+    let Some(mut e) = db.entry_mut(eid) else {
+        return false;
+    };
+    // Preserve the loser in entry history before overwriting.
+    let snapshot: Entry = (*e).clone();
+    match &mut e.history {
+        Some(h) => h.add_entry(snapshot),
+        None => {
+            let mut h = History::default();
+            h.add_entry(snapshot);
+            e.history = Some(h);
+        }
+    }
+    apply_bw_to_entry(&mut e, item);
+    true
+}
+
+/// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
+pub fn apply_bw_to_entry(entry: &mut Entry, it: &crate::bw::BwItem) {
+    let login = it.login.clone().unwrap_or_default();
+    entry.set_unprotected(fields::TITLE, it.name.clone());
+    entry.set_protected(fields::USERNAME, login.username.as_deref().unwrap_or_default());
+    entry.set_protected(fields::PASSWORD, login.password.as_deref().unwrap_or_default());
+    entry.set_unprotected(
+        fields::URL,
+        login
+            .uris
+            .as_ref()
+            .and_then(|u| u.first())
+            .and_then(|u| u.uri.clone())
+            .unwrap_or_default(),
+    );
+    entry.set_protected(fields::NOTES, it.notes.as_deref().unwrap_or_default());
+    // Replace non-stamp custom fields wholesale with the BW side's set.
+    entry.fields.retain(|name, _| {
+        is_standard_field(name) || name == SYNC_ID_FIELD || name == SYNC_HASH_FIELD
+    });
+    for f in &it.fields {
+        if f.name == SYNC_ID_FIELD || f.name == SYNC_HASH_FIELD {
+            continue;
+        }
+        entry.set_protected(f.name.clone(), f.value.clone());
+    }
+    if let Some(t) = login.totp.filter(|s| !s.is_empty()) {
+        entry.fields.retain(|name, _| !name.eq_ignore_ascii_case("totp"));
+        entry.set_protected("totp", t);
+    }
+    entry.times.last_modification = Some(chrono::Utc::now().naive_utc());
 }
 
 /// Empty in-memory vault for unit tests (no real .kdbx touched).
 #[cfg(test)]
 pub fn test_vault() -> KdbxVault {
-    use keepass_rs::model::db::database::{Database, DatabaseVersion};
     KdbxVault {
-        db: Database::new(DatabaseVersion::KDBX4),
-        key: CompositeKey::new(),
+        db: Database::new(),
+        password: Secret::new(Vec::new()),
+        keyfile: None,
         path: PathBuf::from("test.kdbx"),
     }
 }
@@ -225,32 +322,20 @@ pub fn test_vault() -> KdbxVault {
 /// The consumption path for automation: workers pull secrets from the local
 /// .kdbx without touching the sync journal or Bitwarden.
 pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret> {
-    let c2p = child_to_parent(db);
-    let mut hits: Vec<(&NodeId, &Entry)> = db
-        .entries
-        .iter()
-        .filter(|(_, e)| e.title == title)
-        .collect();
-    hits.sort_by(|a, b| {
-        group_path(db, a.0, &c2p)
-            .cmp(&group_path(db, b.0, &c2p))
-            .then(a.1.title.cmp(&b.1.title))
-    });
+    let (entries, _) = walk(db);
+    let mut hits: Vec<&WalkedEntry> = entries.iter().filter(|w| entry_title(&w.entry) == title).collect();
+    hits.sort_by(|a, b| a.group_path.cmp(&b.group_path).then(entry_title(&a.entry).cmp(entry_title(&b.entry))));
     match hits.len() {
         0 => anyhow::bail!("no entry titled {:?}", title),
-        1 => {
-            let (_, e) = hits[0];
-            Ok(Secret::new(entry_field_bytes(e, field)?))
-        }
+        1 => Ok(Secret::new(entry_field_bytes(&hits[0].entry, field)?)),
         _ => {
             let paths: Vec<String> = hits
                 .iter()
-                .map(|(eid, e)| {
-                    let gp = group_path(db, eid, &c2p);
-                    if gp.is_empty() {
-                        e.title.clone()
+                .map(|w| {
+                    if w.group_path.is_empty() {
+                        entry_title(&w.entry).to_string()
                     } else {
-                        format!("{}/{}", gp, e.title)
+                        format!("{}/{}", w.group_path, entry_title(&w.entry))
                     }
                 })
                 .collect();
@@ -263,29 +348,38 @@ pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret
     }
 }
 
+fn entry_title(e: &Entry) -> &str {
+    e.get_title().unwrap_or_default()
+}
+
 /// Raw bytes of one entry field. Custom fields are matched case-insensitively;
 /// an unknown name errors listing the available field names.
 fn entry_field_bytes(e: &Entry, field: &str) -> Result<Vec<u8>> {
     let lowered = field.to_ascii_lowercase();
     match lowered.as_str() {
-        "password" => Ok(ps_bytes(&e.password)),
-        "username" => Ok(ps_bytes(&e.username)),
-        "url" => Ok(e.url.as_bytes().to_vec()),
+        "password" => Ok(e.get_password().unwrap_or_default().as_bytes().to_vec()),
+        "username" => Ok(e.get_username().unwrap_or_default().as_bytes().to_vec()),
+        "url" => Ok(e.get_url().unwrap_or_default().as_bytes().to_vec()),
         "totp" => Ok(extract_totp(e).unwrap_or_default().into_bytes()),
-        "notes" => Ok(ps_bytes(&e.notes)),
+        "notes" => Ok(e.get(fields::NOTES).unwrap_or_default().as_bytes().to_vec()),
         custom => match e
-            .custom_fields
+            .fields
             .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(custom))
+            .find(|(name, _)| name.eq_ignore_ascii_case(custom))
         {
-            Some(f) => Ok(ps_bytes(&f.value)),
+            Some((_, v)) => Ok(v.get().as_bytes().to_vec()),
             None => {
                 let mut names = vec!["password", "username", "url", "totp", "notes"];
-                names.extend(e.custom_fields.iter().map(|f| f.name.as_str()));
+                names.extend(
+                    e.fields
+                        .keys()
+                        .filter(|k| !is_standard_field(k))
+                        .map(|k| k.as_str()),
+                );
                 anyhow::bail!(
                     "no field {:?} on entry {:?}; available: {}",
                     field,
-                    e.title,
+                    entry_title(e),
                     names.join(", ")
                 )
             }
@@ -293,64 +387,49 @@ fn entry_field_bytes(e: &Entry, field: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn ps_bytes(p: &ProtectedString) -> Vec<u8> {
-    p.as_str().as_bytes().to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keepass_rs::model::core::node::NodeId;
-    use keepass_rs::model::core::security::ProtectedString as PS;
-    use keepass_rs::model::db::database::{Database, DatabaseVersion};
-    use keepass_rs::model::entry::{Entry, EntryField};
-    use keepass_rs::model::group::Group;
 
-    fn add_group(db: &mut Database, title: &str, parent: &NodeId) -> NodeId {
-        let id = NodeId::new_uuid();
-        let mut g = Group::new(id.clone());
-        g.title = title.to_string();
-        assert!(db.add_group(g, parent), "add_group {}", title);
-        id
+    fn add_group(db: &mut Database, title: &str, parent: GroupId) -> GroupId {
+        let mut parent = db.group_mut(parent).expect("parent group");
+        let mut g = parent.add_group();
+        g.name = title.to_string();
+        g.id()
+    }
+
+    fn add_entry(db: &mut Database, parent: GroupId, title: &str) -> EntryId {
+        let mut parent = db.group_mut(parent).expect("parent group");
+        let mut e = parent.add_entry();
+        e.set_unprotected(fields::TITLE, title);
+        e.id()
     }
 
     /// "github" is unique and fully populated; "deploy key" exists twice
     /// (Ops and Misc) for the ambiguity test.
     fn fixture_db() -> Database {
-        let mut db = Database::new(DatabaseVersion::KDBX4);
-        let root_id = NodeId::new_uuid();
-        let mut root = Group::new(root_id);
-        root.title = "Root".to_string();
-        assert!(db.add_group(root, &NodeId::new_uuid()));
-        let root = db.root_group_id.clone().unwrap();
+        let mut db = Database::new();
+        let root = db.root().id();
+        let ops = add_group(&mut db, "Ops", root);
+        let misc = add_group(&mut db, "Misc", root);
 
-        let ops = add_group(&mut db, "Ops", &root);
-        let misc = add_group(&mut db, "Misc", &root);
-
-        let mut e = Entry::new(NodeId::new_uuid());
-        e.title = "github".to_string();
-        e.username = PS::new_protected("alice");
-        e.password = PS::new_protected("s3cr3t-pw");
-        e.url = "https://github.com".to_string();
-        e.notes = PS::new_protected("some notes");
-        e.custom_fields.push(EntryField {
-            name: "totp".to_string(),
-            value: PS::new_protected("JBSWY3DPEHPK3PXP"),
-            is_protected: true,
-        });
-        e.custom_fields.push(EntryField {
-            name: "API Key".to_string(),
-            value: PS::new_protected("ak-123"),
-            is_protected: true,
-        });
-        assert!(db.add_entry(e, &ops));
-
-        for parent in [&ops, &misc] {
-            let mut d = Entry::new(NodeId::new_uuid());
-            d.title = "deploy key".to_string();
-            d.username = PS::new_protected("deployer");
-            d.password = PS::new_protected("key-pw");
-            assert!(db.add_entry(d, parent));
+        {
+            let mut g = db.group_mut(ops).unwrap();
+            let mut e = g.add_entry();
+            e.set_unprotected(fields::TITLE, "github");
+            e.set_protected(fields::USERNAME, "alice");
+            e.set_protected(fields::PASSWORD, "s3cr3t-pw");
+            e.set_unprotected(fields::URL, "https://github.com");
+            e.set_protected(fields::NOTES, "some notes");
+            e.set_protected("totp", "JBSWY3DPEHPK3PXP");
+            e.set_protected("API Key", "ak-123");
+        }
+        for parent in [ops, misc] {
+            let mut g = db.group_mut(parent).unwrap();
+            let mut d = g.add_entry();
+            d.set_unprotected(fields::TITLE, "deploy key");
+            d.set_protected(fields::USERNAME, "deployer");
+            d.set_protected(fields::PASSWORD, "key-pw");
         }
         db
     }
@@ -519,10 +598,8 @@ mod tests {
     #[test]
     fn list_entries_sorted_titles_only() {
         let mut db = fixture_db();
-        let root = db.root_group_id.clone().unwrap();
-        let mut e = Entry::new(NodeId::new_uuid());
-        e.title = "zeta-root".to_string();
-        assert!(db.add_entry(e, &root));
+        let root = db.root().id();
+        add_entry(&mut db, root, "zeta-root");
         assert_eq!(
             list_entries(&db),
             vec![
@@ -537,12 +614,10 @@ mod tests {
     #[test]
     fn list_entries_excludes_recycle_bin() {
         let mut db = fixture_db();
-        let root = db.root_group_id.clone().unwrap();
-        let trash = add_group(&mut db, "Trash", &root);
-        db.recycle_bin_uuid = trash.as_uuid().cloned();
-        let mut e = Entry::new(NodeId::new_uuid());
-        e.title = "old-secret".to_string();
-        assert!(db.add_entry(e, &trash));
+        let root = db.root().id();
+        let trash = add_group(&mut db, "Trash", root);
+        db.meta.recyclebin_uuid = Some(trash.uuid());
+        add_entry(&mut db, trash, "old-secret");
         let list = list_entries(&db);
         assert!(!list.iter().any(|(_, t)| t == "old-secret"), "list: {list:?}");
         assert!(list.iter().any(|(_, t)| t == "github"));
@@ -623,57 +698,24 @@ pub enum PutOutcome {
     Updated,
 }
 
-/// Full "a/b/c" path of a group, including the group's own title, root excluded.
-fn full_group_path(db: &Database, gid: &NodeId, c2p: &HashMap<NodeId, NodeId>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let root = db.root_group_id.clone();
-    let mut cur: Option<NodeId> = Some(gid.clone());
-    let mut guard = 0;
-    while let Some(id) = cur {
-        guard += 1;
-        if guard > 256 {
-            break;
-        }
-        if Some(&id) == root.as_ref() {
-            break;
-        }
-        match db.groups.get(&id) {
-            Some(g) => {
-                parts.push(g.title.clone());
-                cur = c2p.get(&id).cloned();
-            }
-            None => break,
-        }
-    }
-    parts.reverse();
-    parts.join("/")
-}
-
 /// Find a group by exact title (deterministic: lowest full path wins), or
 /// create it as a top-level group under root when missing.
-fn find_or_create_group(db: &mut Database, name: &str) -> Result<NodeId> {
-    let c2p = child_to_parent(db);
-    let mut hits: Vec<NodeId> = db
-        .groups
+fn find_or_create_group(db: &mut Database, name: &str) -> Result<GroupId> {
+    let (_, groups) = walk(db);
+    // groups[i].2 is the group's own full path (root excluded), which is the
+    // deterministic sort key the old implementation used.
+    let mut hits: Vec<&(GroupId, String, String)> = groups
         .iter()
-        .filter(|(_, g)| g.title == name)
-        .map(|(gid, _)| gid.clone())
+        .filter(|(_, gname, _)| gname == name)
         .collect();
-    hits.sort_by(|a, b| full_group_path(db, a, &c2p).cmp(&full_group_path(db, b, &c2p)));
-    if let Some(gid) = hits.into_iter().next() {
-        return Ok(gid);
+    hits.sort_by(|a, b| a.2.cmp(&b.2));
+    if let Some((gid, _, _)) = hits.into_iter().next() {
+        return Ok(*gid);
     }
-    let root = db
-        .root_group_id
-        .clone()
-        .context("database has no root group")?;
-    let id = NodeId::new_uuid();
-    let mut g = Group::new(id.clone());
-    g.title = name.to_string();
-    if !db.add_group(g, &root) {
-        anyhow::bail!("failed to create group {name:?}");
-    }
-    Ok(id)
+    let mut root = db.root_mut();
+    let mut g = root.add_group();
+    g.name = name.to_string();
+    Ok(g.id())
 }
 
 fn secret_to_string(s: &Secret) -> String {
@@ -684,16 +726,16 @@ fn secret_to_string(s: &Secret) -> String {
 /// which gives `--update` its merge semantics.
 fn apply_spec_fields(e: &mut Entry, spec: &NewEntrySpec) {
     if let Some(u) = spec.username.as_ref() {
-        e.username = ProtectedString::new_protected(&secret_to_string(u));
+        e.set_protected(fields::USERNAME, secret_to_string(u));
     }
     if let Some(url) = spec.url.as_ref() {
-        e.url = url.clone();
+        e.set_unprotected(fields::URL, url.clone());
     }
     if let Some(p) = spec.password.as_ref() {
-        e.password = ProtectedString::new_protected(&secret_to_string(p));
+        e.set_protected(fields::PASSWORD, secret_to_string(p));
     }
     if let Some(n) = spec.notes.as_ref() {
-        e.notes = ProtectedString::new_protected(&secret_to_string(n));
+        e.set_protected(fields::NOTES, secret_to_string(n));
     }
 }
 
@@ -706,29 +748,23 @@ fn apply_spec_fields(e: &mut Entry, spec: &NewEntrySpec) {
 ///   the entry is never moved between groups. → [`PutOutcome::Updated`]
 /// * Several matches: fail closed listing each entry's group path.
 pub fn put_entry(db: &mut Database, spec: NewEntrySpec) -> Result<PutOutcome> {
-    let c2p = child_to_parent(db);
-    let mut hits: Vec<NodeId> = db
-        .entries
+    let (entries, _) = walk(db);
+    let mut hits: Vec<(EntryId, String)> = entries
         .iter()
-        .filter(|(_, e)| e.title == spec.title)
-        .map(|(eid, _)| eid.clone())
+        .filter(|w| entry_title(&w.entry) == spec.title)
+        .map(|w| (w.id, w.group_path.clone()))
         .collect();
-    hits.sort_by(|a, b| group_path(db, a, &c2p).cmp(&group_path(db, b, &c2p)));
+    hits.sort_by(|a, b| a.1.cmp(&b.1));
     match hits.len() {
         0 => {
             let gid = match spec.group {
                 Some(ref name) => find_or_create_group(db, name)?,
-                None => db
-                    .root_group_id
-                    .clone()
-                    .context("database has no root group")?,
+                None => db.root().id(),
             };
-            let mut e = Entry::new(NodeId::new_uuid());
-            e.title = spec.title.clone();
+            let mut group = db.group_mut(gid).context("target group vanished")?;
+            let mut e = group.add_entry();
+            e.set_unprotected(fields::TITLE, spec.title.clone());
             apply_spec_fields(&mut e, &spec);
-            if !db.add_entry(e, &gid) {
-                anyhow::bail!("failed to add entry {:?}", spec.title);
-            }
             Ok(PutOutcome::Created)
         }
         1 => {
@@ -738,18 +774,14 @@ pub fn put_entry(db: &mut Database, spec: NewEntrySpec) -> Result<PutOutcome> {
                     spec.title
                 );
             }
-            let e = db
-                .entries
-                .get_mut(&hits[0])
-                .context("entry vanished mid-update")?;
-            apply_spec_fields(e, &spec);
+            let mut e = db.entry_mut(hits[0].0).context("entry vanished mid-update")?;
+            apply_spec_fields(&mut e, &spec);
             Ok(PutOutcome::Updated)
         }
         _ => {
             let paths: Vec<String> = hits
                 .iter()
-                .map(|eid| {
-                    let gp = group_path(db, eid, &c2p);
+                .map(|(_, gp)| {
                     if gp.is_empty() {
                         spec.title.clone()
                     } else {
@@ -770,16 +802,12 @@ pub fn put_entry(db: &mut Database, spec: NewEntrySpec) -> Result<PutOutcome> {
 /// Entries in the recycle bin are excluded. Root-group entries carry an
 /// empty group path. Titles only — field values are never exposed.
 pub fn list_entries(db: &Database) -> Vec<(String, String)> {
-    let c2p = child_to_parent(db);
-    let recycle = db.recycle_bin_uuid.map(NodeId::from_uuid);
-    let mut v: Vec<(String, String)> = db
-        .entries
+    let (entries, _) = walk(db);
+    let recycle = db.meta.recyclebin_uuid;
+    let mut v: Vec<(String, String)> = entries
         .iter()
-        .filter(|(eid, _)| match db.find_parent_group_of_entry(eid) {
-            Some(p) => Some(p) != recycle,
-            None => true,
-        })
-        .map(|(eid, e)| (group_path(db, eid, &c2p), e.title.clone()))
+        .filter(|w| Some(w.parent.uuid()) != recycle)
+        .map(|w| (w.group_path.clone(), entry_title(&w.entry).to_string()))
         .collect();
     v.sort();
     v

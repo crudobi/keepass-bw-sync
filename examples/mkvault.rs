@@ -9,10 +9,6 @@
 
 use std::fs::File;
 
-use keepass_rs::model::core::node::NodeId;
-use keepass_rs::model::db::composite_key::CompositeKey;
-use keepass_rs::model::db::database::{Database, DatabaseVersion};
-use keepass_rs::model::group::Group;
 use zeroize::Zeroizing;
 
 fn main() {
@@ -28,13 +24,11 @@ fn main() {
         "KBS_MASTER_PASSWORD is empty; refusing to create a vault with an empty password"
     );
 
-    let mut db = Database::new(DatabaseVersion::KDBX4);
-    let mut root = Group::new(NodeId::new_uuid());
-    root.title = "Root".to_string();
-    assert!(db.add_group(root, &NodeId::new_uuid()));
+    let mut db = keepass::Database::new();
+    db.root_mut().name = "Root".to_string();
 
-    let key = CompositeKey::new().with_password(pw.as_bytes());
+    let key = keepass::DatabaseKey::new().with_password(pw.as_str());
     let mut f = File::create(&out).expect("create output file");
-    keepass_rs::save_database(&mut f, &db, &key).expect("save database");
+    db.save(&mut f, key).expect("save database");
     println!("created empty KDBX4 vault at {out}");
 }

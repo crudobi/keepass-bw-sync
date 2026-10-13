@@ -1,13 +1,13 @@
 //! Mutate one entry in a test KeePass2 database (for E2E sync testing).
 //!
-//! Usage: KBS_MASTER_PASSWORD=... cargo run --example tweak -- <db.kdbx> <entry-title> <new-password>
+//! Usage: KBS_MASTER_PASSWORD=<redacted>
 //!
 //! Finds the entry by title, replaces its password, and saves atomically.
 //! Test tooling only.
 
-use keepass_bw_sync::kdbx::{open_vault, save_vault};
+use keepass::db::{fields, EntryId};
+use keepass_bw_sync::kdbx::{extract_entries, open_vault, save_vault};
 use keepass_bw_sync::secret::Secret;
-use keepass_rs::model::core::security::ProtectedString;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -18,15 +18,18 @@ fn main() -> anyhow::Result<()> {
     let secret = Secret::from_str(&pw);
 
     let mut vault = open_vault(std::path::Path::new(path), &secret, None)?;
-    let mut found = false;
-    for (_id, e) in vault.db.entries.iter_mut() {
-        if e.title == *title {
-            e.password = ProtectedString::new_protected(new_pw);
-            found = true;
-            break;
-        }
-    }
-    anyhow::ensure!(found, "entry not found: {title}");
+    let target = extract_entries(&vault.db)
+        .into_iter()
+        .find(|e| e.title == *title);
+    let Some(target) = target else {
+        anyhow::bail!("entry not found: {title}");
+    };
+    let mut e = vault
+        .db
+        .entry_mut(EntryId::from_uuid(target.uuid))
+        .expect("entry vanished");
+    e.set_protected(fields::PASSWORD, new_pw.as_str());
+    drop(e);
     save_vault(&vault)?;
     println!("tweaked '{title}'");
     Ok(())

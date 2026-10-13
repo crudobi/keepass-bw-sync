@@ -1,6 +1,6 @@
 //! End-to-end test against a stub `bw serve`.
 //!
-//! Builds a fixture .kdbx with keepass-rs, runs the real plan/apply pipeline
+//! Builds a fixture .kdbx with the keepass crate, runs the real plan/apply pipeline
 //! against a minimal in-process HTTP stub, and asserts idempotency,
 //! quarantine-on-foreign-edit, and atomic save/reopen.
 
@@ -132,31 +132,23 @@ fn spawn_stub() -> (String, Arc<Mutex<Stub>>) {
 }
 
 fn fixture_kdbx(path: &std::path::Path) {
-    use keepass_rs::model::core::node::NodeId;
-    use keepass_rs::model::core::security::ProtectedString as PS;
-    use keepass_rs::model::db::composite_key::CompositeKey;
-    use keepass_rs::model::db::database::{Database, DatabaseVersion};
-    use keepass_rs::model::entry::Entry;
-    use keepass_rs::model::group::Group;
+    use keepass::db::fields;
 
-    let mut db = Database::new(DatabaseVersion::KDBX4);
-    let root_id = NodeId::new_uuid();
-    let mut root_group = Group::new(root_id);
-    root_group.title = "Root".to_string();
-    // Dummy parent (not in groups) + no root yet => accepted as the root group.
-    assert!(db.add_group(root_group, &NodeId::new_uuid()));
-    let root = db.root_group_id.clone().unwrap();
-    for (title, user, pw) in [("github", "alice", "s3cret1"), ("bank", "bob", "s3cret2")] {
-        let mut e = Entry::new(NodeId::new_uuid());
-        e.title = title.into();
-        e.username = PS::new_protected(user);
-        e.password = PS::new_protected(pw);
-        e.url = format!("https://{}.example.com", title);
-        assert!(db.add_entry(e, &root));
+    let mut db = keepass::Database::new();
+    {
+        let mut root = db.root_mut();
+        root.name = "Root".into();
+        for (title, user, pw) in [("github", "alice", "s3cret1"), ("bank", "bob", "s3cret2")] {
+            let mut e = root.add_entry();
+            e.set_unprotected(fields::TITLE, title);
+            e.set_protected(fields::USERNAME, user);
+            e.set_protected(fields::PASSWORD, pw);
+            e.set_unprotected(fields::URL, format!("https://{}.example.com", title));
+        }
     }
-    let key = CompositeKey::new().with_password(b"test-password");
+    let key = keepass::DatabaseKey::new().with_password("test-password");
     let mut f = std::fs::File::create(path).unwrap();
-    keepass_rs::save_database(&mut f, &db, &key).unwrap();
+    db.save(&mut f, key).unwrap();
 }
 
 fn tmpdir() -> std::path::PathBuf {
