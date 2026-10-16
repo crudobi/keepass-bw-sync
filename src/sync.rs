@@ -84,10 +84,6 @@ fn stamp_uuid(item: &BwItem) -> Option<Uuid> {
     id.and_then(|s| s.parse().ok())
 }
 
-fn stamp_hash(item: &BwItem) -> Option<String> {
-    item.stamps().1.filter(|s| !s.is_empty())
-}
-
 /// The flat placement model: an entry's top-level KeePass group name
 /// corresponds to a Bitwarden folder of the same name. Root-group entries
 /// (and items with no folder) map to "".
@@ -185,7 +181,11 @@ pub fn plan(
                     || kp_tombstones.contains(&u)
                     || journal.tombstoned(&u)?;
                 if kp_has {
-                    let baseline = stamp_hash(it).unwrap_or_else(|| it.content_hash_hex());
+                    let baseline = it
+                        .stamps()
+                        .1
+                        .filter(|x| !x.is_empty())
+                        .unwrap_or_else(|| it.content_hash_hex());
                     journal.upsert_mapping(&u, &it.id, &baseline)?;
                 } else {
                     actions.push(Action::Quarantine(QuarantineCase {
@@ -305,6 +305,34 @@ pub fn plan(
                             });
                         }
                     } else {
+                        // A Bitwarden-side change to resolve: --writeback
+                        // applies it into KeePass, --force overwrites it
+                        // from KeePass, otherwise it quarantines. The two
+                        // arms below differ only in quarantine kind/detail
+                        // (foreign edit vs genuine divergence).
+                        let bw_change = |kind: &'static str, detail: &str, bw_id: &str| -> Action {
+                            if opts.writeback {
+                                Action::WritebackEdit {
+                                    bw_id: bw_id.to_string(),
+                                    kp_uuid: e.uuid,
+                                    item_idx: bi,
+                                }
+                            } else if opts.force {
+                                Action::UpdateBw {
+                                    bw_id: bw_id.to_string(),
+                                    entry_idx: idx,
+                                    expected_revision: it.revision_date.clone(),
+                                }
+                            } else {
+                                Action::Quarantine(QuarantineCase {
+                                    kind,
+                                    kp_uuid: Some(e.uuid),
+                                    bw_id: Some(bw_id.to_string()),
+                                    title: e.title.clone(),
+                                    detail: detail.into(),
+                                })
+                            }
+                        };
                         match (kp_changed, bw_changed) {
                             (false, false) => {}
                             (true, false) => actions.push(Action::UpdateBw {
@@ -314,59 +342,23 @@ pub fn plan(
                             }),
                             (false, true) => {
                                 // Foreign Bitwarden edit.
-                                if opts.writeback {
-                                    actions.push(Action::WritebackEdit {
-                                        bw_id,
-                                        kp_uuid: e.uuid,
-                                        item_idx: bi,
-                                    });
-                                } else if opts.force {
-                                    actions.push(Action::UpdateBw {
-                                        bw_id,
-                                        entry_idx: idx,
-                                        expected_revision: it.revision_date.clone(),
-                                    });
-                                } else {
-                                    actions.push(Action::Quarantine(QuarantineCase {
-                                        kind: "foreign-bw-edit",
-                                        kp_uuid: Some(e.uuid),
-                                        bw_id: Some(bw_id),
-                                        title: e.title.clone(),
-                                        detail: "Bitwarden item changed outside the engine; kept as-is pending review".into(),
-                                    }));
-                                }
+                                actions.push(bw_change(
+                                    "foreign-bw-edit",
+                                    "Bitwarden item changed outside the engine; kept as-is pending review",
+                                    &bw_id,
+                                ));
                             }
                             (true, true) => {
                                 // Genuine divergence: both sides changed
-                                // to DIFFERENT content. There is no safe
-                                // automatic merge for secrets, so the
-                                // default is quarantine — but the explicit
-                                // resolution flags apply, exactly as in
-                                // the foreign-edit arm. (This arm used to
-                                // ignore the flags, which made
-                                // crash-recovery quarantines unresolvable
-                                // through the tool.)
-                                if opts.writeback {
-                                    actions.push(Action::WritebackEdit {
-                                        bw_id,
-                                        kp_uuid: e.uuid,
-                                        item_idx: bi,
-                                    });
-                                } else if opts.force {
-                                    actions.push(Action::UpdateBw {
-                                        bw_id,
-                                        entry_idx: idx,
-                                        expected_revision: it.revision_date.clone(),
-                                    });
-                                } else {
-                                    actions.push(Action::Quarantine(QuarantineCase {
-                                        kind: "concurrent-edit",
-                                        kp_uuid: Some(e.uuid),
-                                        bw_id: Some(bw_id),
-                                        title: e.title.clone(),
-                                        detail: "both sides changed since last sync; no automatic merge for secrets".into(),
-                                    }));
-                                }
+                                // to DIFFERENT content. Same resolution as
+                                // a foreign edit — the flags must apply
+                                // here too, or crash-recovery quarantines
+                                // would be unresolvable through the tool.
+                                actions.push(bw_change(
+                                    "concurrent-edit",
+                                    "both sides changed since last sync; no automatic merge for secrets",
+                                    &bw_id,
+                                ));
                             }
                         }
                     }
@@ -468,6 +460,22 @@ pub struct ApplyReport {
 /// [`JournalOp`]s for the caller to commit via [`Journal::apply_ops`] only
 /// after `save_vault()` succeeds, so a mid-apply bail can never leave the
 /// journal claiming KeePass mutations that never reached disk.
+/// Journal op for the plan/apply race: the Bitwarden item changed
+/// between plan and apply, so the action (`what`: "update" / "trash") is
+/// skipped and the case queues for review — instead of aborting the run
+/// and discarding every other action's journal commit.
+fn revision_changed_op(kp_uuid: Uuid, bw_id: &str, title: String, what: &str) -> JournalOp {
+    JournalOp::from(&QuarantineCase {
+        kind: "bw_revision_changed",
+        kp_uuid: Some(kp_uuid),
+        bw_id: Some(bw_id.to_string()),
+        title,
+        detail: format!(
+            "Bitwarden item changed between plan and apply; {what} skipped pending review"
+        ),
+    })
+}
+
 pub fn apply(
     plan: &Plan,
     kp_entries: &[CanonicalEntry],
@@ -528,18 +536,12 @@ pub fn apply(
                         report.updated += 1;
                     }
                     EditOutcome::RevisionChanged => {
-                        // The item changed between plan and apply: skip
-                        // just this edit and quarantine it (mirrors the
-                        // TrashBw race handling) instead of aborting the
-                        // run and discarding every other action's
-                        // journal commit.
-                        journal_ops.push(JournalOp::from(&QuarantineCase {
-                            kind: "bw_revision_changed",
-                            kp_uuid: Some(e.uuid),
-                            bw_id: Some(bw_id.clone()),
-                            title: e.title.clone(),
-                            detail: "Bitwarden item changed between plan and apply; update skipped pending review".into(),
-                        }));
+                        journal_ops.push(revision_changed_op(
+                            e.uuid,
+                            bw_id,
+                            e.title.clone(),
+                            "update",
+                        ));
                         report.quarantined += 1;
                     }
                 }
@@ -561,21 +563,12 @@ pub fn apply(
                         report.trashed += 1;
                     }
                     TrashOutcome::RevisionChanged => {
-                        // The item changed between plan and apply: the exact
-                        // delete-vs-edit race the engine quarantines
-                        // elsewhere. Skip the delete; queue for review.
                         let title = kp_entries
                             .iter()
                             .find(|e| e.uuid == *kp_uuid)
                             .map(|e| e.title.clone())
                             .unwrap_or_else(|| bw_id.clone());
-                        journal_ops.push(JournalOp::from(&QuarantineCase {
-                            kind: "bw_revision_changed",
-                            kp_uuid: Some(*kp_uuid),
-                            bw_id: Some(bw_id.clone()),
-                            title,
-                            detail: "Bitwarden item changed between plan and apply; trash skipped pending review".into(),
-                        }));
+                        journal_ops.push(revision_changed_op(*kp_uuid, bw_id, title, "trash"));
                         report.quarantined += 1;
                     }
                 }
@@ -636,13 +629,11 @@ pub fn apply(
     Ok((report, journal_ops))
 }
 
-/// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
-/// (Implementation moved to [`crate::kdbx::apply_bw_to_entry`] with the vault
-/// layer in the keepass 0.15 port.)
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bw::{BwClient, BwLogin};
+    use crate::journal::test_journal;
     use crate::canonical::CanonicalEntry;
     use crate::secret::Secret;
 
@@ -696,15 +687,9 @@ mod tests {
         }
     }
 
-    fn mem_journal() -> Journal {
-        Journal::open(Path::new(":memory:")).unwrap()
-    }
-
-    use std::path::Path;
-
     #[test]
     fn new_kp_entry_plans_create() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let p = plan(&kp, &HashSet::new(), &[], &[], &j, &SyncOpts::default()).unwrap();
         assert_eq!(p.actions.len(), 1);
@@ -713,7 +698,7 @@ mod tests {
 
     #[test]
     fn unchanged_pair_plans_nothing() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let h = kp[0].content_hash_hex();
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
@@ -727,7 +712,7 @@ mod tests {
 
     #[test]
     fn kp_change_plans_update() {
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
         j.upsert_mapping(&kp[0].uuid, "bw-1", &bi.content_hash_hex())
@@ -740,7 +725,7 @@ mod tests {
 
     #[test]
     fn foreign_bw_edit_quarantines_by_default() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let h = kp[0].content_hash_hex();
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
@@ -752,7 +737,7 @@ mod tests {
 
     #[test]
     fn force_overwrites_foreign_bw_edit() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let h = kp[0].content_hash_hex();
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
@@ -765,7 +750,7 @@ mod tests {
 
     #[test]
     fn bw_trash_with_unchanged_kp_recycles() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let h = kp[0].content_hash_hex();
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
@@ -777,7 +762,7 @@ mod tests {
 
     #[test]
     fn permanently_deleted_bw_item_is_not_resurrected() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         j.upsert_mapping(&kp[0].uuid, "bw-1", "h").unwrap();
         j.record_tombstone(&kp[0].uuid, Some("bw-1"), "bitwarden").unwrap();
@@ -791,7 +776,7 @@ mod tests {
         // Regression (2026-10-03): a transient empty listing once recycled a
         // whole test database. Fail closed instead of treating it as a
         // mass Bitwarden delete.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let h = kp[0].content_hash_hex();
         j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
@@ -815,7 +800,7 @@ mod tests {
         // Only a fully-empty listing used to trip the fail-closed guard; a
         // truncated listing walked into mass RecycleKp. Bail when more than
         // half of the live-mapped items are missing from the listing.
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![];
         let mut items = vec![];
         for i in 1..=4u8 {
@@ -832,7 +817,7 @@ mod tests {
     fn partial_listing_missing_minority_plans_recycle() {
         // 1 of 4 missing is a genuine single delete, not a transport
         // failure: plan the one recycle, nothing else.
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![];
         let mut items = vec![];
         for i in 1..=4u8 {
@@ -848,7 +833,7 @@ mod tests {
 
     #[test]
     fn trash_plan_carries_expected_revision() {
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         kp[0].deleted = true; // in the KeePass recycle bin
         let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r42");
@@ -867,7 +852,7 @@ mod tests {
         // mid-apply bail (e.g. a 503 on a later action) left the journal
         // claiming KeePass mutations that never reached disk. Ops are now
         // collected and only committed via Journal::apply_ops.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let p = Plan {
             actions: vec![
@@ -895,7 +880,7 @@ mod tests {
 
     #[test]
     fn journal_ops_commit_only_via_apply_ops() {
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let p = Plan {
             actions: vec![Action::Quarantine(QuarantineCase {
@@ -923,7 +908,7 @@ mod tests {
     fn adopt_quarantines_non_login_types() {
         // A secure note must never be reshaped into a login-shaped KeePass
         // entry: it quarantines for human review, item untouched.
-        let j = mem_journal();
+        let j = test_journal();
         let mut note = bw_item("bw-9", None, "r1");
         note.item_type = 2; // secure note
         let opts = SyncOpts {
@@ -940,7 +925,7 @@ mod tests {
         // Stamped, unmapped, but the KeePass entry does not exist (interrupted
         // adopt): upserting a mapping would mint a phantom identity, so the
         // item quarantines for human re-adopt instead.
-        let j = mem_journal();
+        let j = test_journal();
         let orphan = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
         let p = plan(&[], &HashSet::new(), &[orphan], &[], &j, &SyncOpts::default()).unwrap();
         assert_eq!(p.actions.len(), 1);
@@ -957,7 +942,7 @@ mod tests {
         // Positive control for the orphan gate: when the stamped UUID matches
         // a real KeePass entry, the mapping is rebuilt and the in-sync pair
         // is a no-op.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let bi = bw_item("bw-9", Some("11111111-1111-1111-1111-111111111111"), "r1");
         let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
@@ -1052,7 +1037,7 @@ mod tests {
         // old planner read this as (changed, changed) and quarantined two
         // agreeing copies — permanently, since the resolution flags were
         // ignored for that arm.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r2");
         j.upsert_mapping(&kp[0].uuid, "bw-1", "pre-crash-watermark")
@@ -1082,18 +1067,18 @@ mod tests {
             (kp, bi)
         };
 
-        let j = mem_journal();
+        let j = test_journal();
         let (kp, bi) = setup(&j);
         let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
         assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "concurrent-edit"));
 
-        let j = mem_journal();
+        let j = test_journal();
         let (kp, bi) = setup(&j);
         let opts = SyncOpts { force: true, ..Default::default() };
         let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &opts).unwrap();
         assert!(matches!(p.actions[0], Action::UpdateBw { .. }));
 
-        let j = mem_journal();
+        let j = test_journal();
         let (kp, bi) = setup(&j);
         let opts = SyncOpts { writeback: true, ..Default::default() };
         let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &opts).unwrap();
@@ -1104,7 +1089,7 @@ mod tests {
     fn rebuild_with_matching_stamp_is_quiet() {
         // M1, match branch: the stamp hash equals the item's live hash —
         // the rebuild adopts the stamped baseline and the pair is a no-op.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
         let live = bi.content_hash_hex();
@@ -1126,7 +1111,7 @@ mod tests {
         // Bitwarden item. The rebuild must NOT adopt the live state as
         // the baseline: the pair classifies as a foreign edit, and the
         // watermark is the stamped (pre-edit) hash.
-        let j = mem_journal();
+        let j = test_journal();
         let kp = vec![entry("11111111-1111-1111-1111-111111111111")]; // pre-edit content
         let stamped = kp[0].content_hash_hex();
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r2");
@@ -1151,7 +1136,7 @@ mod tests {
         // M5: content is in sync, but the entry moved groups in KeePass —
         // plan a Bitwarden folder update (an UpdateBw with identical
         // content; only the payload's folderId changes).
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         kp[0].group_path = "Ops".into();
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
@@ -1167,7 +1152,7 @@ mod tests {
         assert!(matches!(p.actions[0], Action::UpdateBw { .. }));
 
         // Same folder name: no action.
-        let j = mem_journal();
+        let j = test_journal();
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
         bi.folder_id = Some("f-ops".into());
         let h = bi.content_hash_hex();
@@ -1180,7 +1165,7 @@ mod tests {
         assert!(p.actions.is_empty(), "got {} actions", p.actions.len());
 
         // Nested KeePass group: the TOP-LEVEL name is the folder.
-        let j = mem_journal();
+        let j = test_journal();
         let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
         kp[0].group_path = "Ops/Servers".into();
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
@@ -1200,7 +1185,7 @@ mod tests {
         // L8: a prior run trashed the Bitwarden item but crashed before
         // the journal commit. The tombstone bookkeeping must still
         // complete: tombstone recorded, mapping removed, no action.
-        let j = mem_journal();
+        let j = test_journal();
         let u: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
         j.upsert_mapping(&u, "bw-1", "h").unwrap();
         let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r2");

@@ -6,8 +6,8 @@ use fs2::FileExt;
 use keepass_bw_sync::bw::BwClient;
 use keepass_bw_sync::journal::Journal;
 use keepass_bw_sync::kdbx::{
-    extract_entries, get_entry_field, list_entries, open_vault, put_entry, read_secret_input,
-    save_vault, tombstoned_uuids, NewEntrySpec, PutOutcome,
+    display_path, extract_entries, get_entry_field, list_entries, open_vault, put_entry,
+    read_secret_input, save_vault, tombstoned_uuids, KdbxVault, NewEntrySpec, PutOutcome,
 };
 use keepass_bw_sync::secret::Secret;
 use keepass_bw_sync::sync::{apply, plan, SyncOpts};
@@ -192,6 +192,18 @@ fn load_keyfile(path: &Option<PathBuf>) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Open the vault for a CLI command: get the master password, load any
+/// keyfile bytes, decrypt. The master password is dropped before this
+/// returns, so it leaves scope before any network IO or output in every
+/// caller.
+fn open_cli_vault(kdbx: &std::path::Path, keyfile: &Option<PathBuf>) -> Result<KdbxVault> {
+    let pw = master_password()?;
+    let kf = load_keyfile(keyfile)?;
+    let vault = open_vault(kdbx, &pw, kf.as_deref())?;
+    drop(pw);
+    Ok(vault)
+}
+
 fn master_password() -> Result<Secret> {
     // Zeroizing wrapper: the intermediate String is wiped on drop instead of
     // lingering in allocator memory.
@@ -216,9 +228,6 @@ fn main() -> Result<()> {
             adopt,
             insecure_remote_url,
         } => {
-            // Single-writer: an exclusive flock on <journal>.lock for the
-            // whole run. Fail closed when another sync holds it — concurrent
-            // runs share one .kdbx.tmp path and would diverge the journal.
             let _lock = acquire_journal_lock(&journal)?;
 
             let opts = SyncOpts {
@@ -226,10 +235,7 @@ fn main() -> Result<()> {
                 force,
                 adopt,
             };
-            let pw = master_password()?;
-            let kf = load_keyfile(&keyfile)?;
-            let mut vault = open_vault(&kdbx, &pw, kf.as_deref())?;
-            drop(pw); // master password leaves scope before any network IO
+            let mut vault = open_cli_vault(&kdbx, &keyfile)?;
             // Fail fast on read-only vault formats (KDBX3) BEFORE any
             // Bitwarden write or stamp — the write would otherwise land
             // server-side and only fail at save time.
@@ -275,9 +281,6 @@ fn main() -> Result<()> {
             journal
                 .apply_ops(&journal_ops)
                 .context("commit journal ops")?;
-            // `report.quarantined` counts only actions taken *this run*; the
-            // journal's authoritative pending-review count is the total
-            // unresolved rows, which must agree with the quarantine table.
             let quarantine_pending = journal.unresolved_quarantine_count()?;
             println!("quarantine_pending={quarantine_pending}");
             if report.quarantined > 0 || quarantine_pending > 0 {
@@ -330,10 +333,7 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Get { kdbx, keyfile, title, field } => {
-            let pw = master_password()?;
-            let kf = load_keyfile(&keyfile)?;
-            let vault = open_vault(&kdbx, &pw, kf.as_deref())?;
-            drop(pw); // master password leaves scope before any output
+            let vault = open_cli_vault(&kdbx, &keyfile)?;
             let value = get_entry_field(&vault.db, &title, &field)?;
             {
                 use std::io::Write as _;
@@ -341,7 +341,6 @@ fn main() -> Result<()> {
                     .write_all(value.expose())
                     .context("write field value to stdout")?;
             }
-            // The returned Secret zeroizes its bytes on drop.
         }
         Cmd::Put {
             kdbx,
@@ -368,10 +367,7 @@ fn main() -> Result<()> {
             let password =
                 read_secret_input("password", password_stdin, password_file.as_deref())?;
             let notes = read_secret_input("notes", notes_stdin, notes_file.as_deref())?;
-            let pw = master_password()?;
-            let kf = load_keyfile(&keyfile)?;
-            let mut vault = open_vault(&kdbx, &pw, kf.as_deref())?;
-            drop(pw); // master password leaves scope before mutation
+            let mut vault = open_cli_vault(&kdbx, &keyfile)?;
             // KDBX3 is read-only for this tool: refuse before mutating.
             vault.require_writable()?;
             let title_msg = title.clone();
@@ -392,16 +388,9 @@ fn main() -> Result<()> {
             }
         }
         Cmd::List { kdbx, keyfile } => {
-            let pw = master_password()?;
-            let kf = load_keyfile(&keyfile)?;
-            let vault = open_vault(&kdbx, &pw, kf.as_deref())?;
-            drop(pw); // master password leaves scope before any output
+            let vault = open_cli_vault(&kdbx, &keyfile)?;
             for (gp, t) in list_entries(&vault.db) {
-                if gp.is_empty() {
-                    println!("{t}");
-                } else {
-                    println!("{gp}/{t}");
-                }
+                println!("{}", display_path(&gp, &t));
             }
         }
     }

@@ -326,18 +326,6 @@ fn set_typed_field(e: &mut Entry, name: &str, value: &str, field_type: i32) {
     }
 }
 
-/// The item's URI strings, in order, with null slots dropped — the same
-/// projection [`crate::bw::BwItem::content_hash`] hashes.
-fn bw_uri_strings(login: &crate::bw::BwLogin) -> Vec<String> {
-    login
-        .uris
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|u| u.uri.clone())
-        .collect()
-}
-
 /// Stash a Bitwarden item's URIs beyond the first into `URL <n>` custom
 /// fields (KeePass has a single URL field). Empty slots are skipped so the
 /// canonical projection's ordering stays stable.
@@ -377,7 +365,7 @@ pub fn adopt_bw_entry(
     let mut e = group.add_entry();
     e.set_unprotected(fields::TITLE, item.name.clone());
     let login = item.login.clone().unwrap_or_default();
-    let uri_strings = bw_uri_strings(&login);
+    let uri_strings = login.uri_strings();
     e.set_protected(fields::USERNAME, login.username.unwrap_or_default());
     e.set_protected(fields::PASSWORD, login.password.unwrap_or_default());
     e.set_unprotected(
@@ -455,7 +443,7 @@ pub fn writeback_entry(db: &mut Database, uuid: Uuid, item: &crate::bw::BwItem) 
 /// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
 pub fn apply_bw_to_entry(entry: &mut Entry, it: &crate::bw::BwItem) {
     let login = it.login.clone().unwrap_or_default();
-    let uri_strings = bw_uri_strings(&login);
+    let uri_strings = login.uri_strings();
     entry.set_unprotected(fields::TITLE, it.name.clone());
     entry.set_protected(fields::USERNAME, login.username.as_deref().unwrap_or_default());
     entry.set_protected(fields::PASSWORD, login.password.as_deref().unwrap_or_default());
@@ -511,9 +499,6 @@ pub fn test_vault() -> KdbxVault {
 /// caller can disambiguate. Recycle-bin entries are invisible here (as in
 /// [`list_entries`]): a title that exists only in the bin is "not found",
 /// so automation can never be silently served a trashed secret.
-///
-/// The consumption path for automation: workers pull secrets from the local
-/// .kdbx without touching the sync journal or Bitwarden.
 pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret> {
     let (entries, _) = walk(db);
     let recycle = db.meta.recyclebin_uuid;
@@ -528,13 +513,7 @@ pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret
         _ => {
             let paths: Vec<String> = hits
                 .iter()
-                .map(|w| {
-                    if w.group_path.is_empty() {
-                        entry_title(&w.entry).to_string()
-                    } else {
-                        format!("{}/{}", w.group_path, entry_title(&w.entry))
-                    }
-                })
+                .map(|w| display_path(&w.group_path, entry_title(&w.entry)))
                 .collect();
             anyhow::bail!(
                 "multiple entries titled {:?}:\n  {}",
@@ -547,6 +526,17 @@ pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret
 
 fn entry_title(e: &Entry) -> &str {
     e.get_title().unwrap_or_default()
+}
+
+/// `group/title` display form (bare title for root-group entries). Used
+/// wherever an entry is named for a human: duplicate-title errors and
+/// the `list` inventory.
+pub fn display_path(group_path: &str, title: &str) -> String {
+    if group_path.is_empty() {
+        title.to_string()
+    } else {
+        format!("{group_path}/{title}")
+    }
 }
 
 /// Raw bytes of one entry field. Custom fields are matched case-insensitively;
@@ -956,12 +946,8 @@ mod tests {
     fn require_writable_rejects_kdbx3() {
         let mut db = Database::new();
         db.config.version = DatabaseVersion::KDB3(1);
-        let v = KdbxVault {
-            db,
-            password: Secret::new(Vec::new()),
-            keyfile: None,
-            path: PathBuf::from("x.kdbx"),
-        };
+        let mut v = test_vault();
+        v.db = db;
         let err = v.require_writable().unwrap_err().to_string();
         assert!(err.contains("KDBX3"), "unexpected error: {err}");
         assert!(err.contains("KDBX4"), "unexpected error: {err}");
@@ -973,12 +959,8 @@ mod tests {
         db.config.version = DatabaseVersion::KDB4(0);
         normalize_version(&mut db);
         assert_eq!(db.config.version, DatabaseVersion::KDB4(1));
-        let v = KdbxVault {
-            db,
-            password: Secret::new(Vec::new()),
-            keyfile: None,
-            path: PathBuf::from("x.kdbx"),
-        };
+        let mut v = test_vault();
+        v.db = db;
         assert!(v.require_writable().is_ok());
     }
 
@@ -994,12 +976,9 @@ mod tests {
         let path = dir.join("vault.kdbx");
         std::fs::write(&path, b"placeholder").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let v = KdbxVault {
-            db: Database::new(),
-            password: Secret::from_str("pw"),
-            keyfile: None,
-            path: path.clone(),
-        };
+        let mut v = test_vault();
+        v.password = Secret::from_str("pw");
+        v.path = path.clone();
         save_vault(&v).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "save must preserve the existing vault mode");
@@ -1007,12 +986,9 @@ mod tests {
         // Brand-new vault starts owner-only.
         let path2 = dir.join("fresh.kdbx");
         let _ = std::fs::remove_file(&path2);
-        let v2 = KdbxVault {
-            db: Database::new(),
-            password: Secret::from_str("pw"),
-            keyfile: None,
-            path: path2.clone(),
-        };
+        let mut v2 = test_vault();
+        v2.password = Secret::from_str("pw");
+        v2.path = path2.clone();
         save_vault(&v2).unwrap();
         let mode = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "fresh vault must be 0600");
@@ -1194,13 +1170,7 @@ pub fn put_entry(db: &mut Database, spec: NewEntrySpec) -> Result<PutOutcome> {
         _ => {
             let paths: Vec<String> = hits
                 .iter()
-                .map(|(_, gp)| {
-                    if gp.is_empty() {
-                        spec.title.clone()
-                    } else {
-                        format!("{gp}/{}", spec.title)
-                    }
-                })
+                .map(|(_, gp)| display_path(gp, &spec.title))
                 .collect();
             anyhow::bail!(
                 "multiple entries titled {:?}:\n  {}",

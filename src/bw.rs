@@ -121,6 +121,20 @@ pub struct BwFolder {
     pub name: String,
 }
 
+impl BwLogin {
+    /// The item's URI strings, in order, with null slots dropped — the
+    /// projection [`BwItem::content_hash`] hashes and the KeePass side
+    /// stores (first in the URL field, the rest in `URL <n>` fields).
+    pub fn uri_strings(&self) -> Vec<String> {
+        self.uris
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|u| u.uri.clone())
+            .collect()
+    }
+}
+
 impl BwItem {
     /// (sync_id, sync_hash) stamps, when present.
     pub fn stamps(&self) -> (Option<String>, Option<String>) {
@@ -141,15 +155,7 @@ impl BwItem {
         let login = self.login.clone().unwrap_or_default();
         // All URIs hash, in order (first under "url", rest under "uri") —
         // the same projection the KeePass side builds.
-        let urls: Vec<String> = login
-            .uris
-            .as_ref()
-            .map(|us| {
-                us.iter()
-                    .filter_map(|u| u.uri.clone())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+        let urls = login.uri_strings();
         let custom: Vec<(String, String, i32)> = self
             .fields
             .iter()
@@ -208,6 +214,25 @@ fn serve_message(v: &serde_json::Value) -> &str {
     v.get("message").and_then(|m| m.as_str()).unwrap_or("(no message)")
 }
 
+/// Shared response gate for the write endpoints: HTTP status first, then
+/// the serve-level `success` flag. `what` names the operation in the error
+/// text. The body is only ever surfaced via [`serve_message`].
+fn check_serve_ok(status: reqwest::StatusCode, v: &serde_json::Value, what: &str) -> Result<()> {
+    if !status.is_success() {
+        bail!("bw {what} HTTP {}: {}", status, serve_message(v));
+    }
+    if v.get("success").and_then(|x| x.as_bool()) == Some(false) {
+        bail!("bw {what} reported failure: {}", serve_message(v));
+    }
+    Ok(())
+}
+
+/// The `{"id": ...}` body of a create call (folder or item).
+#[derive(Deserialize)]
+struct Created {
+    id: String,
+}
+
 fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -217,14 +242,12 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Validate a `bw serve` base URL with a real URL parser. The previous
-/// hand-rolled host extraction had a parser differential:
-/// `http://example.com#@127.0.0.1:8087/` read as loopback (the `#` fragment
-/// confused the split logic) while reqwest connected to example.com.
-/// Parsing with the same URL implementation the HTTP client uses removes
-/// the whole class: scheme must be http, the parsed host must be
-/// 127.0.0.0/8, ::1, or localhost, and userinfo is refused outright (it
-/// has no legitimate use here and only serves parser confusion).
+/// Validate a `bw serve` base URL with a real URL parser. A hand-rolled
+/// host extraction had a parser differential: `http://example.com#@127.0.0.1:8087/`
+/// read as loopback (the `#` fragment confused the split) while reqwest
+/// connected to example.com. Scheme must be http, the parsed host
+/// 127.0.0.0/8, ::1, or localhost, and userinfo is refused outright (it has
+/// no legitimate use here, only parser confusion).
 fn validate_loopback_url(base: &str) -> Result<()> {
     let url = reqwest::Url::parse(base)
         .map_err(|e| anyhow::anyhow!("invalid bw serve URL {base:?}: {e}"))?;
@@ -300,13 +323,7 @@ impl BwClient {
             .context("POST /sync")?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().context("parse /sync")?;
-        if !status.is_success() {
-            bail!("bw sync HTTP {}: {}", status, serve_message(&v));
-        }
-        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
-            bail!("bw sync reported failure: {}", serve_message(&v));
-        }
-        Ok(())
+        check_serve_ok(status, &v, "sync")
     }
 
     pub fn list_items(&self) -> Result<Vec<BwItem>> {
@@ -337,10 +354,6 @@ impl BwClient {
     }
 
     pub fn create_folder(&self, name: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Created {
-            id: String,
-        }
         let resp = self
             .http
             .post(format!("{}/object/folder", self.base))
@@ -414,10 +427,6 @@ impl BwClient {
         entry: &CanonicalEntry,
         folder_id: Option<&str>,
     ) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Created {
-            id: String,
-        }
         let hash = entry.content_hash_hex();
         let payload = Self::item_payload(entry, folder_id, &hash, None);
         let resp = self
@@ -455,12 +464,7 @@ impl BwClient {
             .with_context(|| format!("PUT item {}", id))?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().context("parse PUT item")?;
-        if !status.is_success() {
-            bail!("bw edit HTTP {}: {}", status, serve_message(&v));
-        }
-        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
-            bail!("bw edit reported failure: {}", serve_message(&v));
-        }
+        check_serve_ok(status, &v, "edit")?;
         Ok(EditOutcome::Updated)
     }
 
@@ -481,12 +485,7 @@ impl BwClient {
             .with_context(|| format!("DELETE item {}", id))?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().context("parse DELETE item")?;
-        if !status.is_success() {
-            bail!("bw delete HTTP {}: {}", status, serve_message(&v));
-        }
-        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
-            bail!("bw delete reported failure: {}", serve_message(&v));
-        }
+        check_serve_ok(status, &v, "delete")?;
         Ok(TrashOutcome::Trashed)
     }
 
@@ -543,13 +542,7 @@ impl BwClient {
             .with_context(|| format!("PUT stamp item {}", id))?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().context("parse PUT stamp item")?;
-        if !status.is_success() {
-            bail!("bw stamp HTTP {}: {}", status, serve_message(&v));
-        }
-        if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
-            bail!("bw stamp reported failure: {}", serve_message(&v));
-        }
-        Ok(())
+        check_serve_ok(status, &v, "stamp")
     }
 }
 
@@ -651,6 +644,22 @@ pub(crate) mod tests {
         .to_string()
     }
 
+    fn entry() -> CanonicalEntry {
+        CanonicalEntry {
+            uuid: uuid::Uuid::nil(),
+            title: "t".into(),
+            username: "u".into(),
+            password: crate::secret::Secret::from_str("p"),
+            url: "".into(),
+            uris: vec![],
+            notes: "".into(),
+            totp: None,
+            custom: vec![],
+            group_path: "".into(),
+            deleted: false,
+        }
+    }
+
     #[test]
     fn trash_item_skips_on_revision_change() {
         // GET returns r2 while the plan saw r1: the item changed under us.
@@ -712,19 +721,7 @@ pub(crate) mod tests {
             ),
         ]);
         let bw = BwClient::new(&base).unwrap();
-        let entry = crate::canonical::CanonicalEntry {
-            uuid: uuid::Uuid::nil(),
-            title: "t".into(),
-            username: "u".into(),
-            password: crate::secret::Secret::from_str("p"),
-            url: "".into(),
-            uris: vec![],
-            notes: "".into(),
-            totp: None,
-            custom: vec![],
-            group_path: "".into(),
-            deleted: false,
-        };
+        let entry = entry();
         let err = bw.edit_item("bw-1", &entry, None, "r1").unwrap_err();
         assert!(err.to_string().contains("500"), "unexpected error: {err}");
     }
@@ -735,19 +732,7 @@ pub(crate) mod tests {
         // caller quarantines just this item instead of aborting the run.
         let base = stub_server(vec![("GET /object/item/bw-1 ".into(), 200, item_json("r2"))]);
         let bw = BwClient::new(&base).unwrap();
-        let entry = crate::canonical::CanonicalEntry {
-            uuid: uuid::Uuid::nil(),
-            title: "t".into(),
-            username: "u".into(),
-            password: crate::secret::Secret::from_str("p"),
-            url: "".into(),
-            uris: vec![],
-            notes: "".into(),
-            totp: None,
-            custom: vec![],
-            group_path: "".into(),
-            deleted: false,
-        };
+        let entry = entry();
         let out = bw.edit_item("bw-1", &entry, None, "r1").unwrap();
         assert_eq!(out, EditOutcome::RevisionChanged);
     }
@@ -771,26 +756,17 @@ pub(crate) mod tests {
             "revisionDate": "r1", "deletedDate": null
         }))
         .unwrap();
-        let entry = crate::canonical::CanonicalEntry {
-            uuid: uuid::Uuid::nil(),
-            title: "t".into(),
-            username: "u".into(),
-            password: crate::secret::Secret::from_str("p"),
-            url: "https://a.example.com".into(),
-            uris: vec![
-                "https://a.example.com".into(),
-                "https://b.example.com".into(),
-            ],
-            notes: "".into(),
-            totp: None,
-            custom: vec![
-                ("Visible".into(), "v".into(), 0),
-                ("Secret Q".into(), "s".into(), 1),
-                ("Flag".into(), "true".into(), 2),
-            ],
-            group_path: "".into(),
-            deleted: false,
-        };
+        let mut entry = entry();
+        entry.url = "https://a.example.com".into();
+        entry.uris = vec![
+            "https://a.example.com".into(),
+            "https://b.example.com".into(),
+        ];
+        entry.custom = vec![
+            ("Visible".into(), "v".into(), 0),
+            ("Secret Q".into(), "s".into(), 1),
+            ("Flag".into(), "true".into(), 2),
+        ];
         let payload = BwClient::item_payload(&entry, None, "hashhex", Some(&src));
         assert_eq!(payload["favorite"], true);
         let fields = payload["fields"].as_array().unwrap();

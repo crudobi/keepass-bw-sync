@@ -27,10 +27,6 @@ impl Secret {
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 impl Drop for Secret {

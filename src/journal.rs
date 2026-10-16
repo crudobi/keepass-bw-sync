@@ -63,6 +63,12 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// In-memory journal for unit tests (no real file touched).
+#[cfg(test)]
+pub fn test_journal() -> Journal {
+    Journal::open(Path::new(":memory:")).unwrap()
+}
+
 impl Journal {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
@@ -303,8 +309,7 @@ impl Journal {
     ///
     /// Commits atomically: the ops run inside a single transaction, so a
     /// mid-commit failure rolls back instead of leaving a partial op
-    /// sequence. `&self` is enough — `execute_batch` runs the transaction
-    /// statements on the same connection without needing `&mut`.
+    /// sequence.
     pub fn apply_ops(&self, ops: &[JournalOp]) -> Result<()> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -346,27 +351,33 @@ impl Journal {
 mod tests {
     use super::*;
 
-    fn mem_journal() -> Journal {
-        Journal::open(Path::new(":memory:")).unwrap()
+    fn test_uuid() -> Uuid {
+        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
+    }
+
+    /// A fresh on-disk journal path in a per-test temp dir (any stale file
+    /// from a previous run removed).
+    fn temp_journal(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kbs-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("sync.db");
+        let _ = std::fs::remove_file(&p);
+        p
     }
 
     #[test]
-    fn mem_journal_skips_chmod() {
+    fn in_memory_journal_skips_chmod() {
         // :memory: must not trip the 0600 path; journal still works.
-        let j = mem_journal();
-        j.upsert_mapping(
-            &Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
-            "bw-1",
-            "h",
-        )
+        let j = test_journal();
+        j.upsert_mapping(&test_uuid(), "bw-1", "h")
         .unwrap();
         assert_eq!(j.live_mapping_count().unwrap(), 1);
     }
 
     #[test]
     fn quarantine_dedups_unresolved_rows() {
-        let j = mem_journal();
-        let u = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let j = test_journal();
+        let u = test_uuid();
         j.quarantine("foreign-bw-edit", Some(&u), Some("bw-1"), "t", "d")
             .unwrap();
         // Same (identity, kind) while unresolved: no duplicate row.
@@ -381,7 +392,7 @@ mod tests {
 
     #[test]
     fn quarantine_resolve_closes_row() {
-        let j = mem_journal();
+        let j = test_journal();
         j.quarantine("k", None, Some("bw-9"), "t", "d").unwrap();
         let rows = j.list_quarantine().unwrap();
         assert_eq!(rows.len(), 1);
@@ -394,7 +405,7 @@ mod tests {
 
     #[test]
     fn unresolved_quarantine_count_counts_only_open_rows() {
-        let j = mem_journal();
+        let j = test_journal();
         assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
         j.quarantine("k", None, Some("bw-1"), "t", "d").unwrap();
         // Same identity while unresolved: deduped, still 1.
@@ -409,8 +420,8 @@ mod tests {
 
     #[test]
     fn apply_ops_commits_in_order() {
-        let j = mem_journal();
-        let u = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let j = test_journal();
+        let u = test_uuid();
         j.apply_ops(&[
             JournalOp::UpsertMapping {
                 kp_uuid: u,
@@ -433,7 +444,7 @@ mod tests {
 
     #[test]
     fn schema_version_stamped_on_open() {
-        let j = mem_journal();
+        let j = test_journal();
         assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
@@ -441,10 +452,7 @@ mod tests {
     fn newer_schema_version_is_refused() {
         // A journal stamped by a newer build must fail with a clear
         // error, not be misread by an older schema's assumptions.
-        let d = std::env::temp_dir().join(format!("kbs-schema-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("sync.db");
-        let _ = std::fs::remove_file(&p);
+        let p = temp_journal("schema");
         {
             let c = Connection::open(&p).unwrap();
             c.execute_batch("PRAGMA user_version = 99").unwrap();
@@ -461,10 +469,7 @@ mod tests {
     fn legacy_unversioned_journal_is_adopted() {
         // Pre-versioning journals have user_version 0 and the v1 schema:
         // they open fine and get stamped.
-        let d = std::env::temp_dir().join(format!("kbs-legacy-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("sync.db");
-        let _ = std::fs::remove_file(&p);
+        let p = temp_journal("legacy");
         {
             let c = Connection::open(&p).unwrap();
             c.execute_batch(
@@ -485,10 +490,7 @@ mod tests {
         // created 0600; a regression here would expose the mapping to other
         // local users.
         use std::os::unix::fs::PermissionsExt;
-        let d = std::env::temp_dir().join(format!("kbs-perm-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("sync.db");
-        let _ = std::fs::remove_file(&p);
+        let p = temp_journal("perm");
         let _j = Journal::open(&p).unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "journal must be 0600, got {:o}", mode);
