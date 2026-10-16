@@ -24,12 +24,13 @@ fn main() -> anyhow::Result<()> {
     let Some(target) = target else {
         anyhow::bail!("entry not found: {title}");
     };
-    let mut e = vault
-        .db
-        .entry_mut(EntryId::from_uuid(target.uuid))
-        .expect("entry vanished");
-    e.set_protected(fields::PASSWORD, new_pw.as_str());
-    drop(e);
+    {
+        let mut e = vault
+            .db
+            .entry_mut(EntryId::from_uuid(target.uuid))
+            .expect("entry vanished");
+        e.set_protected(fields::PASSWORD, new_pw.as_str());
+    }
     save_vault(&vault)?;
     println!("tweaked '{title}'");
     Ok(())

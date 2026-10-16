@@ -39,25 +39,51 @@ fn build_key(password: &Secret, keyfile: Option<&[u8]>) -> Result<DatabaseKey> {
     Ok(key)
 }
 
+/// In-memory version normalization at open. The keepass crate's writer
+/// emits KDBX 4.1 only (its dump path rejects any other version). A KDBX
+/// 4.0 database (e.g. one last written by an older KeePassXC) is therefore
+/// upgraded in memory: 4.1 is a strict superset, every KeePassXC >= 2.7
+/// reads it, and the first save writes the vault back as 4.1.
+fn normalize_version(db: &mut Database) {
+    if db.config.version == DatabaseVersion::KDB4(0) {
+        db.config.version = DatabaseVersion::KDB4(1);
+    }
+}
+
 /// Open and decrypt the .kdbx at `path`. Nothing plaintext touches disk.
 pub fn open_vault(path: &Path, password: &Secret, keyfile: Option<&[u8]>) -> Result<KdbxVault> {
     let key = build_key(password, keyfile)?;
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut db = Database::open(&mut f, key).context("decrypt .kdbx (wrong password/keyfile?)")?;
-    // The keepass crate's writer emits KDBX 4.1 only (its dump path rejects
-    // any other version). A KDBX 4.0 database (e.g. one last written by an
-    // older KeePassXC) is therefore upgraded in memory at open: 4.1 is a
-    // strict superset, every KeePassXC >= 2.7 reads it, and the first save
-    // writes the vault back as 4.1.
-    if db.config.version == DatabaseVersion::KDB4(0) {
-        db.config.version = DatabaseVersion::KDB4(1);
-    }
+    normalize_version(&mut db);
     Ok(KdbxVault {
         db,
         password: Secret::new(password.expose().to_vec()),
         keyfile: keyfile.map(|k| k.to_vec()),
         path: path.to_path_buf(),
     })
+}
+
+impl KdbxVault {
+    /// Gate for write paths (sync, put): call right after open, BEFORE any
+    /// Bitwarden write or stamp. The keepass crate's writer emits KDBX4
+    /// only and rejects KDBX3 saves outright — without this gate a KDBX3
+    /// vault reads fine (`get`/`list` work) and `sync` would perform its
+    /// Bitwarden writes and adopt-stamps first, then fail at `save_vault`,
+    /// leaving orphan stamps that quarantine on the next run. Read paths
+    /// never call this: KDBX3 stays fully readable.
+    pub fn require_writable(&self) -> Result<()> {
+        match &self.db.config.version {
+            DatabaseVersion::KDB4(_) => Ok(()),
+            DatabaseVersion::KDB3(_) => anyhow::bail!(
+                "KDBX3 vaults are read-only for this tool — upgrade the database to KDBX4 \
+                 (open and save it once in KeePassXC) before syncing or writing"
+            ),
+            other => anyhow::bail!(
+                "unsupported vault format {other:?}: only KDBX4 vaults are writable"
+            ),
+        }
+    }
 }
 
 /// The standard KDBX field names. Anything else in an entry's field map is a
@@ -114,31 +140,130 @@ fn walk(db: &Database) -> (Vec<WalkedEntry>, Vec<(GroupId, String, String)>) {
     (entries, groups)
 }
 
-/// TOTP is carried as a plain custom field named "totp" (case-insensitive).
+/// Field names that carry TOTP material (see [`extract_totp`]). They are
+/// consumed as TOTP, never synced as ordinary custom fields — leaving the
+/// KeePassXC seed/settings in the custom set would hash differently from
+/// the Bitwarden side forever (its TOTP lives in `login.totp`).
+fn is_totp_source_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("totp")
+        || name.eq_ignore_ascii_case("otp")
+        || name.eq_ignore_ascii_case("TOTP Seed")
+        || name.eq_ignore_ascii_case("TOTP Settings")
+}
+
+/// Extra URIs (beyond the entry's single URL field) round-trip through
+/// custom fields named `URL <n>` with n >= 2 — the representation
+/// adopt/writeback write and the canonical projection reads back.
+fn extra_uri_index(name: &str) -> Option<u32> {
+    let n: u32 = name.strip_prefix("URL ")?.parse().ok()?;
+    (n >= 2).then_some(n)
+}
+
+/// TOTP extraction, in precedence order:
+///
+/// 1. a field literally named `totp` — this engine's own representation
+///    (a base32 seed or an otpauth:// URL, passed through verbatim);
+/// 2. KeePass2's `otp` field (KeeOtp convention: an otpauth:// URL);
+/// 3. KeePassXC's `TOTP Seed` + `TOTP Settings` pair, folded into an
+///    otpauth:// URL.
 fn extract_totp(entry: &Entry) -> Option<String> {
-    entry
-        .fields
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("totp"))
-        .map(|(_, v)| v.get().clone())
-        .filter(|s| !s.is_empty())
+    let field = |name: &str| -> Option<String> {
+        entry
+            .fields
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.get().clone())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(t) = field("totp") {
+        return Some(t);
+    }
+    if let Some(t) = field("otp") {
+        return Some(t);
+    }
+    let seed = field("TOTP Seed")?;
+    let (digits, period, algorithm) =
+        parse_totp_settings(field("TOTP Settings").as_deref());
+    let label = entry.get_title().unwrap_or_default();
+    Some(format!(
+        "otpauth://totp/{label}?secret={}&digits={digits}&period={period}&algorithm={algorithm}",
+        seed.replace([' ', '-'], "")
+    ))
+}
+
+/// Parse KeePassXC's `TOTP Settings` value: `<period>;<digits>` with an
+/// optional third component naming the hash algorithm. Defaults are
+/// 30 s / 6 digits / SHA1; anything unparsable falls back per-component
+/// rather than dropping the TOTP.
+fn parse_totp_settings(s: Option<&str>) -> (u32, u32, String) {
+    let mut digits = 6u32;
+    let mut period = 30u32;
+    let mut algorithm = "SHA1".to_string();
+    if let Some(s) = s {
+        let parts: Vec<&str> = s.split(';').collect();
+        if let Some(p) = parts.first() {
+            if let Ok(p) = p.trim().parse() {
+                period = p;
+            }
+        }
+        if let Some(d) = parts.get(1) {
+            if let Ok(d) = d.trim().parse() {
+                digits = d;
+            }
+        }
+        if let Some(a) = parts.get(2) {
+            let a = a.trim();
+            if !a.is_empty() {
+                algorithm = a.to_uppercase();
+            }
+        }
+    }
+    (digits, period, algorithm)
 }
 
 fn entry_to_canonical(db: &Database, w: &WalkedEntry) -> CanonicalEntry {
     let entry = &w.entry;
     let deleted = db.meta.recyclebin_uuid == Some(w.parent.uuid());
-    let custom: Vec<(String, String)> = entry
+    let url = entry.get_url().unwrap_or_default().to_string();
+    let mut uris: Vec<String> = Vec::new();
+    if !url.is_empty() {
+        uris.push(url.clone());
+    }
+    let mut extras: Vec<(u32, String)> = entry
         .fields
         .iter()
-        .filter(|(name, _)| !is_standard_field(name) && !name.eq_ignore_ascii_case("totp"))
-        .map(|(name, v)| (name.clone(), v.get().clone()))
+        .filter_map(|(name, v)| extra_uri_index(name).map(|i| (i, v.get().clone())))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    extras.sort();
+    uris.extend(extras.into_iter().map(|(_, v)| v));
+    // Field type projection: KeePass protected <-> Bitwarden hidden (1),
+    // unprotected <-> text (0). A Bitwarden boolean (2) lands protected
+    // and projects back as 1 — the value survives, the boolean-ness does
+    // not (KeePass has no boolean custom fields).
+    let custom: Vec<(String, String, i32)> = entry
+        .fields
+        .iter()
+        .filter(|(name, _)| {
+            !is_standard_field(name)
+                && !is_totp_source_field(name)
+                && extra_uri_index(name).is_none()
+        })
+        .map(|(name, v)| {
+            (
+                name.clone(),
+                v.get().clone(),
+                if v.is_protected() { 1 } else { 0 },
+            )
+        })
         .collect();
     CanonicalEntry {
         uuid: w.id.uuid(),
         title: entry.get_title().unwrap_or_default().to_string(),
         username: entry.get_username().unwrap_or_default().to_string(),
         password: Secret::from_str(entry.get_password().unwrap_or_default()),
-        url: entry.get_url().unwrap_or_default().to_string(),
+        url,
+        uris,
         notes: entry.get(fields::NOTES).unwrap_or_default().to_string(),
         totp: extract_totp(entry),
         custom,
@@ -159,11 +284,26 @@ pub fn tombstoned_uuids(db: &Database) -> HashSet<Uuid> {
 }
 
 /// Crash-safe save: write temp file, fsync, atomic rename, fsync parent dir.
+///
+/// The rename replaces the vault file, so the temp file's permissions are
+/// what the vault ends up with: `File::create` would give it umask
+/// defaults (typically 0644) and silently relax an owner-only vault. The
+/// existing vault's mode is therefore applied to the temp file before the
+/// rename; a brand-new vault starts 0600.
 pub fn save_vault(v: &KdbxVault) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let key = build_key(&v.password, v.keyfile.as_deref())?;
     let tmp = v.path.with_extension("kdbx.tmp");
+    #[cfg(unix)]
+    let mode = std::fs::metadata(&v.path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
     {
         let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .context("chmod tmp vault")?;
         v.db.save(&mut f, key).context("serialize .kdbx")?;
         f.sync_all().context("fsync tmp")?;
     }
@@ -175,31 +315,76 @@ pub fn save_vault(v: &KdbxVault) -> Result<()> {
     Ok(())
 }
 
-/// Create a KeePass entry from Bitwarden-side content (adopt path), under the
-/// root group. Returns the new entry's UUID.
+/// Set a custom field honoring the Bitwarden field type: hidden (1) and
+/// boolean (2) land protected, text (0) unprotected — the inverse of the
+/// canonical projection in [`entry_to_canonical`].
+fn set_typed_field(e: &mut Entry, name: &str, value: &str, field_type: i32) {
+    if field_type == 0 {
+        e.set_unprotected(name, value);
+    } else {
+        e.set_protected(name, value);
+    }
+}
+
+/// The item's URI strings, in order, with null slots dropped — the same
+/// projection [`crate::bw::BwItem::content_hash`] hashes.
+fn bw_uri_strings(login: &crate::bw::BwLogin) -> Vec<String> {
+    login
+        .uris
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|u| u.uri.clone())
+        .collect()
+}
+
+/// Stash a Bitwarden item's URIs beyond the first into `URL <n>` custom
+/// fields (KeePass has a single URL field). Empty slots are skipped so the
+/// canonical projection's ordering stays stable.
+fn stash_extra_uris(e: &mut Entry, uri_strings: &[String]) {
+    for (i, uri) in uri_strings.iter().skip(1).enumerate() {
+        if !uri.is_empty() {
+            e.set_protected(format!("URL {}", i + 2), uri.clone());
+        }
+    }
+}
+
+/// Create a KeePass entry from Bitwarden-side content (adopt path).
+/// Returns the new entry's UUID.
 ///
-/// Bitwarden custom fields ride along as KeePass custom fields (protected),
-/// minus the sync stamps, which the adopt arm stamps back onto the Bitwarden
-/// item instead of copying into KeePass. A field named "totp" (case
-/// insensitive) is skipped when the item carries a real TOTP — KeePass
-/// represents TOTP as its own field, and the collision would double-count in
+/// Placement (flat model): the entry lands in the top-level group named
+/// by the Bitwarden item's folder (`folder_name`, resolved by the caller
+/// from the item's folderId), created when missing; no folder means the
+/// root group.
+///
+/// Bitwarden custom fields ride along as KeePass custom fields with their
+/// type honored (hidden stays protected), minus the sync stamps, which
+/// the adopt arm stamps back onto the Bitwarden item instead of copying
+/// into KeePass. A field named "totp" (case insensitive) is skipped when
+/// the item carries a real TOTP — KeePass represents TOTP as its own
+/// field, and the collision would double-count in
 /// [`CanonicalEntry::content_hash`].
-pub fn adopt_bw_entry(db: &mut Database, item: &crate::bw::BwItem) -> Uuid {
-    let mut root = db.root_mut();
-    let mut e = root.add_entry();
+pub fn adopt_bw_entry(
+    db: &mut Database,
+    item: &crate::bw::BwItem,
+    folder_name: Option<&str>,
+) -> Result<Uuid> {
+    let gid = match folder_name {
+        Some(name) if !name.is_empty() => find_or_create_group(db, name)?,
+        _ => db.root().id(),
+    };
+    let mut group = db.group_mut(gid).context("adopt target group vanished")?;
+    let mut e = group.add_entry();
     e.set_unprotected(fields::TITLE, item.name.clone());
     let login = item.login.clone().unwrap_or_default();
+    let uri_strings = bw_uri_strings(&login);
     e.set_protected(fields::USERNAME, login.username.unwrap_or_default());
     e.set_protected(fields::PASSWORD, login.password.unwrap_or_default());
     e.set_unprotected(
         fields::URL,
-        login
-            .uris
-            .unwrap_or_default()
-            .into_iter()
-            .find_map(|u| u.uri)
-            .unwrap_or_default(),
+        uri_strings.first().cloned().unwrap_or_default(),
     );
+    stash_extra_uris(&mut e, &uri_strings);
     e.set_protected(fields::NOTES, item.notes.as_deref().unwrap_or_default());
     let totp = login.totp.clone().filter(|s| !s.is_empty());
     if let Some(t) = totp {
@@ -215,9 +400,9 @@ pub fn adopt_bw_entry(db: &mut Database, item: &crate::bw::BwItem) -> Uuid {
         if skip_totp && f.name.eq_ignore_ascii_case("totp") {
             continue;
         }
-        e.set_protected(f.name.clone(), f.value.clone());
+        set_typed_field(&mut e, &f.name, &f.value, f.field_type);
     }
-    e.id().uuid()
+    Ok(e.id().uuid())
 }
 
 /// Recycle one entry by UUID, mirroring the old `remove_entry(id, true)`:
@@ -230,7 +415,6 @@ pub fn recycle_entry(db: &mut Database, uuid: Uuid) -> bool {
     }
     if let Some(rb) = db.recycle_bin() {
         let rb_id = rb.id();
-        drop(rb);
         if let Some(mut e) = db.entry_mut(eid) {
             return e.move_to(rb_id).is_ok();
         }
@@ -271,29 +455,36 @@ pub fn writeback_entry(db: &mut Database, uuid: Uuid, item: &crate::bw::BwItem) 
 /// Overwrite a KeePass entry's syncable fields from a Bitwarden item.
 pub fn apply_bw_to_entry(entry: &mut Entry, it: &crate::bw::BwItem) {
     let login = it.login.clone().unwrap_or_default();
+    let uri_strings = bw_uri_strings(&login);
     entry.set_unprotected(fields::TITLE, it.name.clone());
     entry.set_protected(fields::USERNAME, login.username.as_deref().unwrap_or_default());
     entry.set_protected(fields::PASSWORD, login.password.as_deref().unwrap_or_default());
     entry.set_unprotected(
         fields::URL,
-        login
-            .uris
-            .as_ref()
-            .and_then(|u| u.first())
-            .and_then(|u| u.uri.clone())
-            .unwrap_or_default(),
+        uri_strings.first().cloned().unwrap_or_default(),
     );
     entry.set_protected(fields::NOTES, it.notes.as_deref().unwrap_or_default());
     // Replace non-stamp custom fields wholesale with the BW side's set.
+    // The KeePass `totp` field is retained through the wholesale replace:
+    // when the BW item carries no TOTP of its own, deleting the KeePass
+    // field would silently destroy a secret — fail-safe is to keep it
+    // (the next plan sees the divergence and surfaces it). When the BW
+    // item DOES carry a TOTP, it overwrites below.
     entry.fields.retain(|name, _| {
-        is_standard_field(name) || name == SYNC_ID_FIELD || name == SYNC_HASH_FIELD
+        is_standard_field(name)
+            || name == SYNC_ID_FIELD
+            || name == SYNC_HASH_FIELD
+            || name.eq_ignore_ascii_case("totp")
     });
     for f in &it.fields {
         if f.name == SYNC_ID_FIELD || f.name == SYNC_HASH_FIELD {
             continue;
         }
-        entry.set_protected(f.name.clone(), f.value.clone());
+        set_typed_field(entry, &f.name, &f.value, f.field_type);
     }
+    // URIs beyond the first ride in `URL <n>` fields (rewritten from the
+    // item's set; the retain above already cleared the old ones).
+    stash_extra_uris(entry, &uri_strings);
     if let Some(t) = login.totp.filter(|s| !s.is_empty()) {
         entry.fields.retain(|name, _| !name.eq_ignore_ascii_case("totp"));
         entry.set_protected("totp", t);
@@ -317,13 +508,19 @@ pub fn test_vault() -> KdbxVault {
 /// The field argument is one of: password (default), username, url, totp,
 /// notes, or a custom-field name (matched case-insensitively). Zero matches
 /// errors; multiple matches error listing each entry group path so the
-/// caller can disambiguate.
+/// caller can disambiguate. Recycle-bin entries are invisible here (as in
+/// [`list_entries`]): a title that exists only in the bin is "not found",
+/// so automation can never be silently served a trashed secret.
 ///
 /// The consumption path for automation: workers pull secrets from the local
 /// .kdbx without touching the sync journal or Bitwarden.
 pub fn get_entry_field(db: &Database, title: &str, field: &str) -> Result<Secret> {
     let (entries, _) = walk(db);
-    let mut hits: Vec<&WalkedEntry> = entries.iter().filter(|w| entry_title(&w.entry) == title).collect();
+    let recycle = db.meta.recyclebin_uuid;
+    let mut hits: Vec<&WalkedEntry> = entries
+        .iter()
+        .filter(|w| Some(w.parent.uuid()) != recycle && entry_title(&w.entry) == title)
+        .collect();
     hits.sort_by(|a, b| a.group_path.cmp(&b.group_path).then(entry_title(&a.entry).cmp(entry_title(&b.entry))));
     match hits.len() {
         0 => anyhow::bail!("no entry titled {:?}", title),
@@ -622,11 +819,212 @@ mod tests {
         assert!(!list.iter().any(|(_, t)| t == "old-secret"), "list: {list:?}");
         assert!(list.iter().any(|(_, t)| t == "github"));
     }
+
+    /// fixture_db plus a recycle bin holding a trashed "old-secret".
+    fn fixture_db_with_bin() -> Database {
+        let mut db = fixture_db();
+        let root = db.root().id();
+        let trash = add_group(&mut db, "Trash", root);
+        db.meta.recyclebin_uuid = Some(trash.uuid());
+        let mut g = db.group_mut(trash).unwrap();
+        let mut e = g.add_entry();
+        e.set_unprotected(fields::TITLE, "old-secret");
+        e.set_protected(fields::PASSWORD, "dead-pw");
+        db
+    }
+
+    #[test]
+    fn get_ignores_recycle_bin_entries() {
+        let db = fixture_db_with_bin();
+        // A title that exists only in the bin is "not found": automation
+        // must never be silently served a rotated-out secret.
+        let msg = get_err(&db, "old-secret", "password");
+        assert!(msg.contains("no entry titled"), "unexpected error: {msg}");
+        // Live entries still resolve.
+        assert_eq!(get(&db, "github", "password"), "s3cr3t-pw");
+    }
+
+    #[test]
+    fn put_update_into_recycle_bin_only_errors() {
+        let mut db = fixture_db_with_bin();
+        let mut spec = put_spec("old-secret");
+        spec.update = true;
+        spec.password = Some(Secret::from_str("new-pw"));
+        let msg = put_entry(&mut db, spec).unwrap_err().to_string();
+        assert!(msg.contains("recycle bin"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn put_create_over_recycle_bin_title_makes_fresh_live_entry() {
+        let mut db = fixture_db_with_bin();
+        let mut spec = put_spec("old-secret");
+        spec.password = Some(Secret::from_str("new-pw"));
+        assert!(matches!(put_entry(&mut db, spec), Ok(PutOutcome::Created)));
+        assert_eq!(get(&db, "old-secret", "password"), "new-pw");
+    }
+
+    #[test]
+    fn totp_from_otp_field_passes_through() {
+        // KeePass2/KeeOtp convention: the `otp` field holds a full
+        // otpauth:// URL.
+        let mut db = Database::new();
+        let root = db.root().id();
+        let eid = add_entry(&mut db, root, "otp-entry");
+        let mut e = db.entry_mut(eid).unwrap();
+        e.set_protected("otp", "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=6");
+        assert_eq!(
+            get(&db, "otp-entry", "totp"),
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=6"
+        );
+    }
+
+    #[test]
+    fn totp_from_keepassxc_seed_and_settings() {
+        let mut db = Database::new();
+        let root = db.root().id();
+        for (title, settings) in [("xc-full", Some("45;8")), ("xc-default", None)] {
+            let eid = add_entry(&mut db, root, title);
+            let mut e = db.entry_mut(eid).unwrap();
+            e.set_protected("TOTP Seed", "JBSWY3DPEHPK3PXP");
+            if let Some(s) = settings {
+                e.set_protected("TOTP Settings", s);
+            }
+        }
+        assert_eq!(
+            get(&db, "xc-full", "totp"),
+            "otpauth://totp/xc-full?secret=JBSWY3DPEHPK3PXP&digits=8&period=45&algorithm=SHA1"
+        );
+        assert_eq!(
+            get(&db, "xc-default", "totp"),
+            "otpauth://totp/xc-default?secret=JBSWY3DPEHPK3PXP&digits=6&period=30&algorithm=SHA1"
+        );
+        // The seed/settings must not leak into the canonical custom set:
+        // the Bitwarden projection carries TOTP in login.totp, so hashing
+        // them as custom fields would disagree forever.
+        let entries = extract_entries(&db);
+        let xc = entries.iter().find(|e| e.title == "xc-full").unwrap();
+        assert!(
+            xc.custom
+                .iter()
+                .all(|(n, _, _)| n != "TOTP Seed" && n != "TOTP Settings"),
+            "custom: {:?}",
+            xc.custom
+        );
+        assert_eq!(
+            xc.totp.as_deref(),
+            Some("otpauth://totp/xc-full?secret=JBSWY3DPEHPK3PXP&digits=8&period=45&algorithm=SHA1")
+        );
+    }
+
+    #[test]
+    fn writeback_preserves_kp_totp_when_bw_has_none() {
+        // The BW item has no login.totp: writeback must not delete the
+        // KeePass entry's TOTP (fail-safe toward not losing secrets).
+        let mut db = fixture_db(); // "github" carries a protected totp field
+        let (walked, _) = walk(&db);
+        let id = walked
+            .iter()
+            .find(|w| entry_title(&w.entry) == "github")
+            .unwrap()
+            .id;
+        let item = crate::bw::BwItem {
+            id: "bw-1".into(),
+            name: "github".into(),
+            notes: None,
+            favorite: false,
+            folder_id: None,
+            login: Some(crate::bw::BwLogin {
+                username: Some("alice".into()),
+                password: Some("s3cr3t-pw".into()),
+                totp: None,
+                uris: None,
+            }),
+            fields: vec![],
+            revision_date: "r1".into(),
+            deleted_date: None,
+            item_type: 1,
+            reprompt: None,
+        };
+        {
+            let mut e = db.entry_mut(id).unwrap();
+            apply_bw_to_entry(&mut e, &item);
+        }
+        assert_eq!(get(&db, "github", "totp"), "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn require_writable_rejects_kdbx3() {
+        let mut db = Database::new();
+        db.config.version = DatabaseVersion::KDB3(1);
+        let v = KdbxVault {
+            db,
+            password: Secret::new(Vec::new()),
+            keyfile: None,
+            path: PathBuf::from("x.kdbx"),
+        };
+        let err = v.require_writable().unwrap_err().to_string();
+        assert!(err.contains("KDBX3"), "unexpected error: {err}");
+        assert!(err.contains("KDBX4"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn normalize_upgrades_kdbx40_and_require_writable_accepts() {
+        let mut db = Database::new();
+        db.config.version = DatabaseVersion::KDB4(0);
+        normalize_version(&mut db);
+        assert_eq!(db.config.version, DatabaseVersion::KDB4(1));
+        let v = KdbxVault {
+            db,
+            password: Secret::new(Vec::new()),
+            keyfile: None,
+            path: PathBuf::from("x.kdbx"),
+        };
+        assert!(v.require_writable().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_vault_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kbs-save-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-existing vault with a non-default mode: the rename must not
+        // relax (or tighten) it.
+        let path = dir.join("vault.kdbx");
+        std::fs::write(&path, b"placeholder").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let v = KdbxVault {
+            db: Database::new(),
+            password: Secret::from_str("pw"),
+            keyfile: None,
+            path: path.clone(),
+        };
+        save_vault(&v).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "save must preserve the existing vault mode");
+
+        // Brand-new vault starts owner-only.
+        let path2 = dir.join("fresh.kdbx");
+        let _ = std::fs::remove_file(&path2);
+        let v2 = KdbxVault {
+            db: Database::new(),
+            password: Secret::from_str("pw"),
+            keyfile: None,
+            path: path2.clone(),
+        };
+        save_vault(&v2).unwrap();
+        let mode = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh vault must be 0600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Local secret management: `put` (write) and `list` (titles-only inventory).
-// These touch the .kdbx only — no journal, no Bitwarden, no lock.
+// These touch the .kdbx only — no journal, no Bitwarden. The CLI holds
+// the journal flock for put's whole read-modify-save so it cannot race a
+// sync run (both writers share the vault and its .kdbx.tmp path).
 // ---------------------------------------------------------------------------
 
 /// Trim exactly one trailing newline (`\n` or `\r\n`) from secret input.
@@ -739,7 +1137,12 @@ fn apply_spec_fields(e: &mut Entry, spec: &NewEntrySpec) {
     }
 }
 
-/// Create or update an entry by exact title (matched globally, across groups).
+/// Create or update an entry by exact title (matched globally, across
+/// groups). Recycle-bin entries do not count as matches — merging into a
+/// trashed entry would write a secret that sync treats as deleted (it
+/// would never become live anywhere). A title that exists only in the
+/// bin is "not found" for create (a fresh live entry is made) and a clear
+/// error for `--update`.
 ///
 /// * No match: create in `spec.group` (created when missing) or the root
 ///   group, applying every provided field. → [`PutOutcome::Created`]
@@ -749,14 +1152,24 @@ fn apply_spec_fields(e: &mut Entry, spec: &NewEntrySpec) {
 /// * Several matches: fail closed listing each entry's group path.
 pub fn put_entry(db: &mut Database, spec: NewEntrySpec) -> Result<PutOutcome> {
     let (entries, _) = walk(db);
-    let mut hits: Vec<(EntryId, String)> = entries
+    let recycle = db.meta.recyclebin_uuid;
+    let (live, bin): (Vec<&WalkedEntry>, Vec<&WalkedEntry>) = entries
         .iter()
         .filter(|w| entry_title(&w.entry) == spec.title)
+        .partition(|w| Some(w.parent.uuid()) != recycle);
+    let mut hits: Vec<(EntryId, String)> = live
+        .iter()
         .map(|w| (w.id, w.group_path.clone()))
         .collect();
     hits.sort_by(|a, b| a.1.cmp(&b.1));
     match hits.len() {
         0 => {
+            if spec.update && !bin.is_empty() {
+                anyhow::bail!(
+                    "entry titled {:?} exists only in the recycle bin; restore it in KeePass first, or drop --update to create a fresh entry",
+                    spec.title
+                );
+            }
             let gid = match spec.group {
                 Some(ref name) => find_or_create_group(db, name)?,
                 None => db.root().id(),

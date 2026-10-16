@@ -178,9 +178,9 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     assert_eq!(entries.len(), 2);
     let tombstones = tombstoned_uuids(&vault.db);
     let items = bw.list_items().unwrap();
-    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
-    assert_eq!(p.actions.len(), 2);
     let folders = bw.list_folders().unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
+    assert_eq!(p.actions.len(), 2);
     let (r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &folders).unwrap();
     assert_eq!(r.created, 2);
     assert_eq!(r.quarantined, 0);
@@ -192,7 +192,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     // Second run: fully idempotent, zero actions.
     let entries = extract_entries(&vault.db);
     let items = bw.list_items().unwrap();
-    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
     assert!(p.actions.is_empty(), "expected idempotent no-op, got {}", p.actions.len());
 
     // Foreign edit on the Bitwarden side: quarantine, never overwrite.
@@ -202,7 +202,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     }
     let entries = extract_entries(&vault.db);
     let items = bw.list_items().unwrap();
-    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
     assert_eq!(p.actions.len(), 1);
     let (r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &folders).unwrap();
     assert_eq!(r.quarantined, 1);
@@ -235,7 +235,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     let opts = SyncOpts { adopt: true, ..Default::default() };
     let entries = extract_entries(&vault.db);
     let items = bw.list_items().unwrap();
-    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
     assert!(
         p.actions.iter().any(|a| matches!(a, Action::AdoptBwNew { .. })),
         "expected an AdoptBwNew action, got {} actions",
@@ -285,7 +285,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     // edit on bw-1 and the un-adoptable secure note re-report every run).
     let entries = extract_entries(&vault.db);
     let items = bw.list_items().unwrap();
-    let p = plan(&entries, &tombstones, &items, &journal, &opts).unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
     assert_eq!(
         p.actions.len(),
         2,
@@ -306,7 +306,7 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     assert_eq!(entries.len(), 3);
     let adopted = entries.iter().find(|e| e.title == "adopted").unwrap();
     assert!(
-        adopted.custom.iter().any(|(k, v)| k == "API key" && v == "abc123"),
+        adopted.custom.iter().any(|(k, v, _)| k == "API key" && v == "abc123"),
         "adopted entry must carry the Bitwarden custom field after save/reopen, got {:?}",
         adopted.custom
     );

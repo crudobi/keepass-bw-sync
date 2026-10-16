@@ -55,6 +55,11 @@ impl std::fmt::Debug for BwLogin {
 pub struct BwField {
     pub name: String,
     pub value: String,
+    /// Bitwarden field type: 0 = text, 1 = hidden, 2 = boolean. Carried
+    /// end-to-end so an engine edit never flattens a hidden field into a
+    /// visible text field. Defaults to 0 for payloads that omit it.
+    #[serde(rename = "type", default)]
+    pub field_type: i32,
 }
 
 #[derive(Clone, Deserialize)]
@@ -134,23 +139,28 @@ impl BwItem {
     /// Content hash in the same space as [`CanonicalEntry::content_hash`].
     pub fn content_hash(&self) -> [u8; 32] {
         let login = self.login.clone().unwrap_or_default();
-        let url = login
+        // All URIs hash, in order (first under "url", rest under "uri") —
+        // the same projection the KeePass side builds.
+        let urls: Vec<String> = login
             .uris
             .as_ref()
-            .and_then(|u| u.first())
-            .and_then(|u| u.uri.clone())
+            .map(|us| {
+                us.iter()
+                    .filter_map(|u| u.uri.clone())
+                    .collect::<Vec<String>>()
+            })
             .unwrap_or_default();
-        let custom: Vec<(String, String)> = self
+        let custom: Vec<(String, String, i32)> = self
             .fields
             .iter()
             .filter(|f| f.name != SYNC_ID_FIELD && f.name != SYNC_HASH_FIELD)
-            .map(|f| (f.name.clone(), f.value.clone()))
+            .map(|f| (f.name.clone(), f.value.clone(), f.field_type))
             .collect();
         hash_fields(
             &self.name,
             login.username.as_deref().unwrap_or_default(),
             login.password.as_deref().unwrap_or_default().as_bytes(),
-            &url,
+            &urls,
             self.notes.as_deref().unwrap_or_default(),
             login.totp.as_deref(),
             &custom,
@@ -181,21 +191,21 @@ pub enum TrashOutcome {
     RevisionChanged,
 }
 
+/// Outcome of [`BwClient::edit_item`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// The item was updated.
+    Updated,
+    /// The item's revision changed between plan and apply: the edit was
+    /// skipped so the caller can quarantine instead of aborting the run.
+    RevisionChanged,
+}
+
 /// The serve `message` field, or a placeholder — never the full response
 /// body, which a future `bw serve` version could fill with echoed request
 /// objects (secret material in logs).
 fn serve_message(v: &serde_json::Value) -> &str {
     v.get("message").and_then(|m| m.as_str()).unwrap_or("(no message)")
-}
-
-/// Host part of an http(s):// URL, without port or brackets.
-fn url_host(base: &str) -> Option<String> {
-    let authority = base.split("://").nth(1)?.split('/').next()?;
-    let authority = authority.rsplit('@').next()?; // strip userinfo
-    if let Some(inner) = authority.strip_prefix('[') {
-        return inner.split(']').next().map(str::to_string); // IPv6 literal
-    }
-    authority.split(':').next().map(str::to_string)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -205,6 +215,40 @@ fn is_loopback_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback()) // 127.0.0.0/8 and ::1
         .unwrap_or(false)
+}
+
+/// Validate a `bw serve` base URL with a real URL parser. The previous
+/// hand-rolled host extraction had a parser differential:
+/// `http://example.com#@127.0.0.1:8087/` read as loopback (the `#` fragment
+/// confused the split logic) while reqwest connected to example.com.
+/// Parsing with the same URL implementation the HTTP client uses removes
+/// the whole class: scheme must be http, the parsed host must be
+/// 127.0.0.0/8, ::1, or localhost, and userinfo is refused outright (it
+/// has no legitimate use here and only serves parser confusion).
+fn validate_loopback_url(base: &str) -> Result<()> {
+    let url = reqwest::Url::parse(base)
+        .map_err(|e| anyhow::anyhow!("invalid bw serve URL {base:?}: {e}"))?;
+    if url.scheme() != "http" {
+        bail!(
+            "refusing bw serve URL {base:?}: scheme must be http (bw serve is plaintext loopback HTTP)"
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("refusing bw serve URL {base:?}: userinfo is not allowed");
+    }
+    // host_str serializes IPv6 hosts bracketed ("[::1]"); unbracket
+    // before the loopback check.
+    let host = url.host_str().unwrap_or_default();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if !is_loopback_host(host) {
+        bail!(
+            "refusing non-loopback bw serve URL {base:?}: plaintext HTTP would exfiltrate vault secrets; pass --insecure-remote-url to override"
+        );
+    }
+    Ok(())
 }
 
 impl BwClient {
@@ -218,11 +262,8 @@ impl BwClient {
     /// Like [`BwClient::new`], but permits non-loopback hosts when the caller
     /// explicitly opts in (CLI `--insecure-remote-url`).
     pub fn new_with_remote(base: &str, allow_remote: bool) -> Result<Self> {
-        let host = url_host(base).unwrap_or_default();
-        if !allow_remote && !is_loopback_host(&host) {
-            bail!(
-                "refusing non-loopback bw serve URL {base:?}: plaintext HTTP would exfiltrate vault secrets; pass --insecure-remote-url to override"
-            );
+        if !allow_remote {
+            validate_loopback_url(base)?;
         }
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -244,11 +285,11 @@ impl BwClient {
         if let Some(data) = v.get("data") {
             // list endpoints nest once more: {"object":"list","data":[...]}
             if let Some(inner) = data.get("data") {
-                return Ok(serde_json::from_value(inner.clone()).context("parse bw list data")?);
+                return serde_json::from_value(inner.clone()).context("parse bw list data");
             }
-            return Ok(serde_json::from_value(data.clone()).context("parse bw data")?);
+            return serde_json::from_value(data.clone()).context("parse bw data");
         }
-        Ok(serde_json::from_value(v).context("parse bw body")?)
+        serde_json::from_value(v).context("parse bw body")
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -330,29 +371,32 @@ impl BwClient {
             serde_json::json!({"name": SYNC_ID_FIELD, "value": entry.uuid.to_string(), "type": 0}),
             serde_json::json!({"name": SYNC_HASH_FIELD, "value": sync_hash_hex, "type": 0}),
         ];
-        for (k, v) in &entry.custom {
-            fields.push(serde_json::json!({"name": k, "value": v, "type": 0}));
+        for (k, v, t) in &entry.custom {
+            fields.push(serde_json::json!({"name": k, "value": v, "type": t}));
         }
-        // Echo the match strategy of the same URL when the source item has
-        // one; the engine's KeePass-side model has no per-URI match of its
-        // own, so there is nothing else to compare against.
-        let uri_match = echo_src
+        // Every URI is written, not just the first: truncating to one
+        // silently destroyed additional URIs on multi-URI items. Each URI
+        // echoes the match strategy of the same URI on the source item
+        // when there is one; the engine's KeePass-side model has no
+        // per-URI match of its own, so there is nothing else to compare
+        // against.
+        let src_uris = echo_src
             .and_then(|s| s.login.as_ref())
-            .and_then(|l| l.uris.as_ref())
-            .and_then(|uris| {
-                uris.iter()
-                    .find(|u| u.uri.as_deref() == Some(entry.url.as_str()))
-            })
-            .and_then(|u| u.match_);
+            .and_then(|l| l.uris.as_ref());
         let mut uris = vec![];
-        if !entry.url.is_empty() {
-            uris.push(serde_json::json!({"uri": entry.url, "match": uri_match}));
+        for u in &entry.uris {
+            let m = src_uris
+                .and_then(|us| us.iter().find(|x| x.uri.as_deref() == Some(u.as_str())))
+                .and_then(|x| x.match_);
+            uris.push(serde_json::json!({"uri": u, "match": m}));
         }
         serde_json::json!({
             "type": echo_src.map(|s| s.item_type).unwrap_or(1),
             "name": entry.title,
             "notes": entry.notes,
-            "favorite": false,
+            // Preserve the item's favorite flag on edit; creates start
+            // unfavorited. (Edits used to silently un-favorite.)
+            "favorite": echo_src.map(|s| s.favorite).unwrap_or(false),
             "folderId": folder_id,
             "reprompt": echo_src.and_then(|s| s.reprompt),
             "fields": fields,
@@ -385,22 +429,21 @@ impl BwClient {
         Ok(self.unwrap::<Created>(resp)?.id)
     }
 
-    /// Optimistic-concurrency edit: abort when `revisionDate` moved.
+    /// Optimistic-concurrency edit: when `revisionDate` moved between plan
+    /// and apply, the edit is skipped and [`EditOutcome::RevisionChanged`]
+    /// is returned so the caller can quarantine just that item — the same
+    /// graceful handling `trash_item` has always had — instead of aborting
+    /// the whole run and discarding every other action's journal commit.
     pub fn edit_item(
         &self,
         id: &str,
         entry: &CanonicalEntry,
         folder_id: Option<&str>,
         expected_revision: &str,
-    ) -> Result<()> {
+    ) -> Result<EditOutcome> {
         let cur = self.get_item(id)?;
         if cur.revision_date != expected_revision {
-            bail!(
-                "stale write on {}: revision {} != expected {}",
-                id,
-                cur.revision_date,
-                expected_revision
-            );
+            return Ok(EditOutcome::RevisionChanged);
         }
         let hash = entry.content_hash_hex();
         let payload = Self::item_payload(entry, folder_id, &hash, Some(&cur));
@@ -418,7 +461,7 @@ impl BwClient {
         if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
             bail!("bw edit reported failure: {}", serve_message(&v));
         }
-        Ok(())
+        Ok(EditOutcome::Updated)
     }
 
     /// Soft delete (moves to trash). With `expected_revision`, re-reads the
@@ -462,7 +505,7 @@ impl BwClient {
         let mut fields: Vec<serde_json::Value> = it
             .fields
             .iter()
-            .map(|f| serde_json::json!({"name": f.name, "value": f.value, "type": 0}))
+            .map(|f| serde_json::json!({"name": f.name, "value": f.value, "type": f.field_type}))
             .collect();
         fields.push(
             serde_json::json!({"name": SYNC_ID_FIELD, "value": kp_uuid.to_string(), "type": 0}),
@@ -515,27 +558,27 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// (expected request-line prefix, HTTP status, response body)
+    type Handlers = Vec<(String, u16, String)>;
+    /// Recorded (request line, body) pairs from a capturing stub.
+    type CapturedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
     /// Minimal canned-response HTTP stub. Serves `handlers` in order, one
     /// connection per request; asserts each request line starts with the
     /// expected prefix.
-    pub(crate) fn stub_server(handlers: Vec<(String, u16, String)>) -> String {
+    pub(crate) fn stub_server(handlers: Handlers) -> String {
         stub_server_inner(handlers, None)
     }
 
     /// Like [`stub_server`], but also records each request's request line
     /// and body, so tests can assert on the exact PUT/POST payload.
-    pub(crate) fn stub_server_capturing(
-        handlers: Vec<(String, u16, String)>,
-    ) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+    pub(crate) fn stub_server_capturing(handlers: Handlers) -> (String, CapturedRequests) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let base = stub_server_inner(handlers, Some(captured.clone()));
         (base, captured)
     }
 
-    fn stub_server_inner(
-        handlers: Vec<(String, u16, String)>,
-        captured: Option<Arc<Mutex<Vec<(String, Vec<u8>)>>>>,
-    ) -> String {
+    fn stub_server_inner(handlers: Handlers, captured: Option<CapturedRequests>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -675,6 +718,7 @@ pub(crate) mod tests {
             username: "u".into(),
             password: crate::secret::Secret::from_str("p"),
             url: "".into(),
+            uris: vec![],
             notes: "".into(),
             totp: None,
             custom: vec![],
@@ -683,6 +727,88 @@ pub(crate) mod tests {
         };
         let err = bw.edit_item("bw-1", &entry, None, "r1").unwrap_err();
         assert!(err.to_string().contains("500"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn edit_item_skips_on_revision_change() {
+        // GET returns r2 while the plan saw r1: no PUT may be issued; the
+        // caller quarantines just this item instead of aborting the run.
+        let base = stub_server(vec![("GET /object/item/bw-1 ".into(), 200, item_json("r2"))]);
+        let bw = BwClient::new(&base).unwrap();
+        let entry = crate::canonical::CanonicalEntry {
+            uuid: uuid::Uuid::nil(),
+            title: "t".into(),
+            username: "u".into(),
+            password: crate::secret::Secret::from_str("p"),
+            url: "".into(),
+            uris: vec![],
+            notes: "".into(),
+            totp: None,
+            custom: vec![],
+            group_path: "".into(),
+            deleted: false,
+        };
+        let out = bw.edit_item("bw-1", &entry, None, "r1").unwrap();
+        assert_eq!(out, EditOutcome::RevisionChanged);
+    }
+
+    #[test]
+    fn item_payload_preserves_favorite_types_and_all_uris() {
+        // One payload must carry: the source item's favorite flag, each
+        // custom field's Bitwarden type (hidden stays hidden), and every
+        // URI with its echoed match strategy.
+        let src: BwItem = serde_json::from_value(serde_json::json!({
+            "id": "bw-1", "name": "t", "notes": null, "favorite": true,
+            "folderId": null, "type": 1, "reprompt": 0,
+            "login": {
+                "username": "u", "password": "p", "totp": null,
+                "uris": [
+                    {"uri": "https://a.example.com", "match": 3},
+                    {"uri": "https://b.example.com", "match": null}
+                ]
+            },
+            "fields": [],
+            "revisionDate": "r1", "deletedDate": null
+        }))
+        .unwrap();
+        let entry = crate::canonical::CanonicalEntry {
+            uuid: uuid::Uuid::nil(),
+            title: "t".into(),
+            username: "u".into(),
+            password: crate::secret::Secret::from_str("p"),
+            url: "https://a.example.com".into(),
+            uris: vec![
+                "https://a.example.com".into(),
+                "https://b.example.com".into(),
+            ],
+            notes: "".into(),
+            totp: None,
+            custom: vec![
+                ("Visible".into(), "v".into(), 0),
+                ("Secret Q".into(), "s".into(), 1),
+                ("Flag".into(), "true".into(), 2),
+            ],
+            group_path: "".into(),
+            deleted: false,
+        };
+        let payload = BwClient::item_payload(&entry, None, "hashhex", Some(&src));
+        assert_eq!(payload["favorite"], true);
+        let fields = payload["fields"].as_array().unwrap();
+        let ty = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f["name"] == n)
+                .map(|f| f["type"].as_i64().unwrap())
+        };
+        assert_eq!(ty("Visible"), Some(0));
+        assert_eq!(ty("Secret Q"), Some(1));
+        assert_eq!(ty("Flag"), Some(2));
+        let uris = payload["login"]["uris"].as_array().unwrap();
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0]["uri"], "https://a.example.com");
+        assert_eq!(uris[0]["match"], 3);
+        assert_eq!(uris[1]["uri"], "https://b.example.com");
+        assert!(uris[1]["match"].is_null());
     }
 
     #[test]
@@ -698,7 +824,10 @@ pub(crate) mod tests {
                     "username": "u", "password": "p", "totp": null,
                     "uris": [{"uri": "https://example.com", "match": 2}]
                 },
-                "fields": [{"name": "API key", "value": "abc", "type": 0}],
+                "fields": [
+                    {"name": "API key", "value": "abc", "type": 0},
+                    {"name": "Secret Q", "value": "shh", "type": 1}
+                ],
                 "revisionDate": "r1", "deletedDate": null
             }
         })
@@ -727,6 +856,14 @@ pub(crate) mod tests {
         assert!(names.contains(&"API key"));
         assert!(names.contains(&"KBS_SYNC_ID"));
         assert!(names.contains(&"KBS_SYNC_HASH"));
+        // Field types ride through stamping: hidden stays hidden.
+        let secret_q = put["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "Secret Q")
+            .unwrap();
+        assert_eq!(secret_q["type"], 1);
         assert_eq!(put["login"]["username"], "u");
         assert_eq!(put["login"]["password"], "p");
         assert_eq!(put["notes"], "n");
@@ -745,5 +882,26 @@ pub(crate) mod tests {
         // Explicit opt-in bypasses the check.
         assert!(BwClient::new_with_remote("http://192.168.1.5:8087", true).is_ok());
         assert!(BwClient::new_with_remote("http://127.0.0.1:8087", true).is_ok());
+    }
+
+    #[test]
+    fn new_rejects_url_parser_differentials() {
+        // The old hand-rolled host parser read this as loopback (text
+        // after '#' looked like the authority to it) while reqwest
+        // connected to example.com. The real parser must reject it.
+        assert!(BwClient::new("http://example.com#@127.0.0.1:8087/").is_err());
+        // Userinfo is refused even on a loopback host.
+        assert!(BwClient::new("http://user@127.0.0.1:8087").is_err());
+        assert!(BwClient::new("http://user:pass@127.0.0.1:8087").is_err());
+        // Scheme must be http: bw serve has no TLS, and an https URL here
+        // would be a different service entirely.
+        assert!(BwClient::new("https://127.0.0.1:8087").is_err());
+        assert!(BwClient::new("ftp://127.0.0.1:8087").is_err());
+        // A fragment after a genuine loopback authority is harmless: the
+        // connection really does go to 127.0.0.1.
+        assert!(BwClient::new("http://127.0.0.1:8087/#frag").is_ok());
+        // Garbage is garbage.
+        assert!(BwClient::new("not a url").is_err());
+        assert!(BwClient::new("127.0.0.1:8087").is_err());
     }
 }

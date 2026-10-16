@@ -44,6 +44,18 @@ pub struct Journal {
     conn: Connection,
 }
 
+/// One unresolved quarantine row:
+/// (id, kind, kp_uuid, bw_id, title, detail).
+pub type QuarantineRow = (i64, String, Option<String>, Option<String>, String, String);
+
+/// Journal schema version, tracked in SQLite's `user_version` pragma.
+/// v1 is the original schema (mapping / tombstone / quarantine). Journals
+/// written before versioning existed report 0 and are adopted as v1 — the
+/// schema is unchanged, only the stamp is new. Future schema changes bump
+/// this and add a migration step in [`Journal::open`]; a journal stamped
+/// newer than this build understands is refused, never guessed at.
+pub const SCHEMA_VERSION: i32 = 1;
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -62,6 +74,24 @@ impl Journal {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        }
+        // Schema version gate (see SCHEMA_VERSION). Migration scaffold:
+        // match on the stored version, apply each step's DDL, then stamp
+        // the new version. v0 -> v1 is adoption only (identical schema).
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("read journal schema version")?;
+        match version {
+            0 | SCHEMA_VERSION => {}
+            v if v > SCHEMA_VERSION => {
+                anyhow::bail!(
+                    "journal {} has schema version {v}, newer than this build supports ({SCHEMA_VERSION}); upgrade keepass-bw-sync",
+                    path.display()
+                );
+            }
+            v => {
+                anyhow::bail!("journal {} has invalid schema version {v}", path.display());
+            }
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS mapping(
@@ -85,7 +115,20 @@ impl Journal {
                  resolved   INTEGER NOT NULL DEFAULT 0);",
         )
         .context("create journal schema")?;
+        if version == 0 {
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .context("stamp journal schema version")?;
+        }
         Ok(Journal { conn })
+    }
+
+    /// The journal's schema version (see [`SCHEMA_VERSION`]).
+    pub fn schema_version(&self) -> Result<i32> {
+        let v: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("read journal schema version")?;
+        Ok(v)
     }
 
     /// (bw_id, last_hash) for a KeePass UUID.
@@ -220,7 +263,7 @@ impl Journal {
         Ok(n > 0)
     }
 
-    pub fn list_quarantine(&self) -> Result<Vec<(i64, String, Option<String>, Option<String>, String, String)>> {
+    pub fn list_quarantine(&self) -> Result<Vec<QuarantineRow>> {
         let mut st = self.conn.prepare(
             "SELECT id, kind, kp_uuid, bw_id, title, detail FROM quarantine
              WHERE resolved = 0 ORDER BY id",
@@ -386,6 +429,53 @@ mod tests {
         assert!(j.mapping_by_kp(&u).unwrap().is_none());
         assert_eq!(j.live_mapping_count().unwrap(), 0);
         assert!(j.live_mapped_bw_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_version_stamped_on_open() {
+        let j = mem_journal();
+        assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn newer_schema_version_is_refused() {
+        // A journal stamped by a newer build must fail with a clear
+        // error, not be misread by an older schema's assumptions.
+        let d = std::env::temp_dir().join(format!("kbs-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("sync.db");
+        let _ = std::fs::remove_file(&p);
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch("PRAGMA user_version = 99").unwrap();
+        }
+        let err = match Journal::open(&p) {
+            Ok(_) => panic!("expected a newer-schema journal to be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("newer"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn legacy_unversioned_journal_is_adopted() {
+        // Pre-versioning journals have user_version 0 and the v1 schema:
+        // they open fine and get stamped.
+        let d = std::env::temp_dir().join(format!("kbs-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("sync.db");
+        let _ = std::fs::remove_file(&p);
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(
+                "CREATE TABLE mapping(kp_uuid TEXT PRIMARY KEY, bw_id TEXT NOT NULL,
+                     last_hash TEXT NOT NULL, last_sync INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+        let j = Journal::open(&p).unwrap();
+        assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[cfg(unix)]

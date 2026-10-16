@@ -15,6 +15,10 @@ impl Secret {
         Secret(bytes)
     }
 
+    // Deliberately not `FromStr`: construction is infallible and the
+    // crate-wide idiom `Secret::from_str` reads better at call sites than
+    // a trait impl that would suggest parsing can fail.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Secret(s.as_bytes().to_vec())
     }

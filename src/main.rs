@@ -26,6 +26,9 @@ enum Cmd {
         /// Path to the KeePass2 database.
         #[arg(long)]
         kdbx: PathBuf,
+        /// Path to a KeePass keyfile (or set KBS_KEYFILE).
+        #[arg(long, env = "KBS_KEYFILE")]
+        keyfile: Option<PathBuf>,
         /// Path to the SQLite sync journal (created if missing).
         #[arg(long)]
         journal: PathBuf,
@@ -64,6 +67,9 @@ enum Cmd {
         /// Path to the KeePass2 database.
         #[arg(long)]
         kdbx: PathBuf,
+        /// Path to a KeePass keyfile (or set KBS_KEYFILE).
+        #[arg(long, env = "KBS_KEYFILE")]
+        keyfile: Option<PathBuf>,
         /// Exact entry title.
         #[arg(long)]
         title: String,
@@ -75,11 +81,21 @@ enum Cmd {
     /// Write an entry into the local .kdbx (create, or replace in place
     /// with --update). Secret material comes only from stdin or a file,
     /// never argv (argv is visible in `ps`). Reads/writes the local .kdbx
-    /// only: no journal, no Bitwarden.
+    /// only: no journal writes, no Bitwarden. The journal flock is held
+    /// for the whole read-modify-save so put cannot race a sync run.
     Put {
         /// Path to the KeePass2 database.
         #[arg(long)]
         kdbx: PathBuf,
+        /// Path to a KeePass keyfile (or set KBS_KEYFILE).
+        #[arg(long, env = "KBS_KEYFILE")]
+        keyfile: Option<PathBuf>,
+        /// Sync journal whose `.lock` file serializes put against sync
+        /// runs. Only the lock file is used; the journal itself is never
+        /// opened. Defaults to `sync.db` next to the vault — pass the same
+        /// journal your sync runs use when it lives elsewhere.
+        #[arg(long)]
+        journal: Option<PathBuf>,
         /// Exact entry title.
         #[arg(long)]
         title: String,
@@ -119,6 +135,9 @@ enum Cmd {
         /// Path to the KeePass2 database.
         #[arg(long)]
         kdbx: PathBuf,
+        /// Path to a KeePass keyfile (or set KBS_KEYFILE).
+        #[arg(long, env = "KBS_KEYFILE")]
+        keyfile: Option<PathBuf>,
     },
 }
 
@@ -161,6 +180,18 @@ fn acquire_journal_lock(journal: &std::path::Path) -> Result<std::fs::File> {
     Ok(lock_file)
 }
 
+/// Load keyfile bytes for a vault open, when a keyfile was given (CLI
+/// `--keyfile` or the `KBS_KEYFILE` env var). The bytes live only in
+/// memory for the duration of the open.
+fn load_keyfile(path: &Option<PathBuf>) -> Result<Option<Vec<u8>>> {
+    match path {
+        Some(p) => Ok(Some(
+            std::fs::read(p).with_context(|| format!("read keyfile {}", p.display()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
 fn master_password() -> Result<Secret> {
     // Zeroizing wrapper: the intermediate String is wiped on drop instead of
     // lingering in allocator memory.
@@ -177,6 +208,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Sync {
             kdbx,
+            keyfile,
             journal,
             bw_url,
             writeback,
@@ -195,8 +227,13 @@ fn main() -> Result<()> {
                 adopt,
             };
             let pw = master_password()?;
-            let mut vault = open_vault(&kdbx, &pw, None)?;
+            let kf = load_keyfile(&keyfile)?;
+            let mut vault = open_vault(&kdbx, &pw, kf.as_deref())?;
             drop(pw); // master password leaves scope before any network IO
+            // Fail fast on read-only vault formats (KDBX3) BEFORE any
+            // Bitwarden write or stamp — the write would otherwise land
+            // server-side and only fail at save time.
+            vault.require_writable()?;
             let entries = extract_entries(&vault.db);
             let tombstones = tombstoned_uuids(&vault.db);
 
@@ -209,7 +246,7 @@ fn main() -> Result<()> {
             let folders = bw.list_folders().context("list bitwarden folders")?;
             let journal = Journal::open(&journal)?;
 
-            let plan = plan(&entries, &tombstones, &items, &journal, &opts)?;
+            let plan = plan(&entries, &tombstones, &items, &folders, &journal, &opts)?;
             println!(
                 "plan: {} actions ({} keepass entries, {} bitwarden items)",
                 plan.actions.len(),
@@ -292,9 +329,10 @@ fn main() -> Result<()> {
                 println!("created fresh journal at {}", journal.display());
             }
         },
-        Cmd::Get { kdbx, title, field } => {
+        Cmd::Get { kdbx, keyfile, title, field } => {
             let pw = master_password()?;
-            let vault = open_vault(&kdbx, &pw, None)?;
+            let kf = load_keyfile(&keyfile)?;
+            let vault = open_vault(&kdbx, &pw, kf.as_deref())?;
             drop(pw); // master password leaves scope before any output
             let value = get_entry_field(&vault.db, &title, &field)?;
             {
@@ -307,6 +345,8 @@ fn main() -> Result<()> {
         }
         Cmd::Put {
             kdbx,
+            keyfile,
+            journal,
             title,
             group,
             username,
@@ -317,12 +357,23 @@ fn main() -> Result<()> {
             notes_file,
             update,
         } => {
+            // Same flock discipline as sync, held for the whole
+            // read-modify-save: put and sync share the vault file and its
+            // .kdbx.tmp path, and a racing sync save used to silently
+            // erase a put entry (its older in-memory DB renamed over the
+            // put, with nothing anywhere detecting the loss).
+            let journal_path = journal.unwrap_or_else(|| kdbx.with_file_name("sync.db"));
+            let _lock = acquire_journal_lock(&journal_path)?;
+
             let password =
                 read_secret_input("password", password_stdin, password_file.as_deref())?;
             let notes = read_secret_input("notes", notes_stdin, notes_file.as_deref())?;
             let pw = master_password()?;
-            let mut vault = open_vault(&kdbx, &pw, None)?;
+            let kf = load_keyfile(&keyfile)?;
+            let mut vault = open_vault(&kdbx, &pw, kf.as_deref())?;
             drop(pw); // master password leaves scope before mutation
+            // KDBX3 is read-only for this tool: refuse before mutating.
+            vault.require_writable()?;
             let title_msg = title.clone();
             let spec = NewEntrySpec {
                 title,
@@ -340,9 +391,10 @@ fn main() -> Result<()> {
                 PutOutcome::Updated => println!("updated {title_msg:?}"),
             }
         }
-        Cmd::List { kdbx } => {
+        Cmd::List { kdbx, keyfile } => {
             let pw = master_password()?;
-            let vault = open_vault(&kdbx, &pw, None)?;
+            let kf = load_keyfile(&keyfile)?;
+            let vault = open_vault(&kdbx, &pw, kf.as_deref())?;
             drop(pw); // master password leaves scope before any output
             for (gp, t) in list_entries(&vault.db) {
                 if gp.is_empty() {

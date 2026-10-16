@@ -142,8 +142,13 @@ globally; `--update` never moves an entry between groups, and `--group`
 is ignored then). `list` prints one `group/title` per line, sorted;
 root-group entries print as bare titles; recycle-bin entries are excluded.
 `put` saves the database atomically after mutation. Neither `put` nor
-`list` touches the sync journal or Bitwarden — but `put` takes no lock,
-so don't run it concurrently with the hourly `kbs-sync` run.
+`list` touches Bitwarden; `put` holds the sync journal lock (via
+`--journal`, defaulting to `sync.db` next to the vault) for its whole
+read-modify-save, so it serializes safely against the hourly `kbs-sync`
+run.
+
+**Keyfiles:** vaults protected with a keyfile work via `--keyfile <path>`
+(or the `KBS_KEYFILE` env var) on every command.
 
 ### Files
 
@@ -199,9 +204,6 @@ chmod 600 "$SECRETS_DIR/vault.kdbx"
 - **No attachment sync** (see Roadmap): large secrets such as SSH private
   keys are stored as text in notes fields. It works, but it is clunky for
   many or large files.
-- **`put` takes no lock**: do not run `put` concurrently with a scheduled
-  `kbs-sync` run. A sync that overlaps a `put` may miss the new entry until
-  the next run (saves are atomic, so nothing corrupts).
 - **`bw serve` is loopback-only plaintext HTTP by design.**
   `--insecure-remote-url` exists for exotic setups, but a remote URL
   exfiltrates vault secrets — only ever point it at hosts you fully trust.
