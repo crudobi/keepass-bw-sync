@@ -156,6 +156,13 @@ pub fn plan(
         }
     }
 
+    // Clear stale missing records for items present in this listing: a
+    // reappearance means the earlier absence was a glitch, not a delete,
+    // so the two-listing clock resets (see the missing arm below).
+    for it in bw_items {
+        journal.clear_missing(&it.id)?;
+    }
+
     // Rebuild journal mappings from stamps (identity lives in the custom
     // field, so any host can rebuild the map). A stamp whose UUID matches no
     // KeePass entry is an orphan — most likely an interrupted adopt whose
@@ -256,7 +263,21 @@ pub fn plan(
                         journal.delete_mapping_by_kp(&e.uuid)?;
                         continue;
                     }
-                    actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                    // A single absence may be a transient listing glitch,
+                    // not a delete: the 2026-11-01 review showed a one-run
+                    // recycle followed by a reappearing item cascading into
+                    // TrashBw, deleting a live entry on both sides. Only
+                    // recycle once a second, independent listing confirms
+                    // the absence; the first sighting just records it.
+                    // (A genuinely trashed BW item still recycles
+                    // immediately — that arm sees the item
+                    // present-but-trashed, not missing.)
+                    if journal.was_missing(&bw_id)? {
+                        journal.clear_missing(&bw_id)?;
+                        actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                    } else {
+                        journal.note_missing(&bw_id, &e.uuid)?;
+                    }
                 }
                 Some(&bi) => {
                     let it = &bw_items[bi];
@@ -814,9 +835,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_listing_missing_minority_plans_recycle() {
-        // 1 of 4 missing is a genuine single delete, not a transport
-        // failure: plan the one recycle, nothing else.
+    fn partial_listing_missing_minority_records_first_then_recycles() {
+        // 1 of 4 missing is no longer recycled on first sighting: a single
+        // absence may be a transient listing glitch. The first partial
+        // listing records the absence (no action); a second, independent
+        // partial listing confirms it and plans the one recycle.
         let j = test_journal();
         let mut kp = vec![];
         let mut items = vec![];
@@ -827,8 +850,40 @@ mod tests {
         }
         let listed: Vec<BwItem> = items[..3].to_vec();
         let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "first sighting must not recycle");
+        assert!(j.was_missing("bw-4").unwrap());
+        let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &SyncOpts::default()).unwrap();
         assert_eq!(p.actions.len(), 1);
         assert!(matches!(p.actions[0], Action::RecycleKp { .. }));
+    }
+
+    #[test]
+    fn partial_listing_then_full_listing_recycles_nothing() {
+        // Regression (2026-11-01 review): a transient partial listing used
+        // to recycle the missing entry, and the reappearing item then
+        // trashed its Bitwarden copy too — a live entry deleted on both
+        // sides by a glitch. Now the glitch run records only, and the
+        // full listing clears the record: no RecycleKp, no TrashBw,
+        // entry intact on both sides.
+        let j = test_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        let partial: Vec<BwItem> = items[..3].to_vec();
+        let p = plan(&kp, &HashSet::new(), &partial, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty());
+        assert!(j.was_missing("bw-4").unwrap());
+        let p = plan(&kp, &HashSet::new(), &items, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            p.actions.is_empty(),
+            "reappearance must clear the glitch, got {:?}",
+            p.actions.len()
+        );
+        assert!(!j.was_missing("bw-4").unwrap());
     }
 
     #[test]

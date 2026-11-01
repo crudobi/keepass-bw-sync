@@ -488,16 +488,23 @@ pub fn apply_bw_to_entry(entry: &mut Entry, it: &crate::bw::BwItem) {
     );
     entry.set_protected(fields::NOTES, it.notes.as_deref().unwrap_or_default());
     // Replace non-stamp custom fields wholesale with the BW side's set.
-    // The KeePass `totp` field is retained through the wholesale replace:
-    // when the BW item carries no TOTP of its own, deleting the KeePass
-    // field would silently destroy a secret — fail-safe is to keep it
-    // (the next plan sees the divergence and surfaces it). When the BW
-    // item DOES carry a TOTP, it overwrites below.
+    // TOTP-source fields are retained when the BW item carries no TOTP:
+    // deleting them would silently destroy a secret — KeePassXC's
+    // `TOTP Seed` / `TOTP Settings` pair, KeePass2's `otp`, or this
+    // engine's `totp` field — and since canonical TOTP would then agree
+    // (None on both sides), no quarantine would ever fire. Fail-safe is
+    // to keep them (the next plan sees the divergence and surfaces it).
+    // When the BW item DOES carry a TOTP, it overwrites below and the old
+    // TOTP-source fields are superseded: the new `totp` field wins
+    // extraction precedence, so keeping stale seed material around would
+    // be a second, shadowed copy of a rotated secret.
+    let bw_has_totp = login.totp.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
     entry.fields.retain(|name, _| {
         is_standard_field(name)
             || name == SYNC_ID_FIELD
             || name == SYNC_HASH_FIELD
-            || name.eq_ignore_ascii_case("totp")
+            || (!bw_has_totp && is_totp_source_field(name))
+            || (bw_has_totp && name.eq_ignore_ascii_case("totp"))
     });
     for f in &it.fields {
         if f.name == SYNC_ID_FIELD || f.name == SYNC_HASH_FIELD {
@@ -975,6 +982,104 @@ mod tests {
             apply_bw_to_entry(&mut e, &item);
         }
         assert_eq!(get(&db, "github", "totp"), "JBSWY3DPEHPK3PXP");
+    }
+
+    /// KeePassXC-style entry: TOTP lives in a `TOTP Seed` / `TOTP Settings`
+    /// pair, not in a field named `totp`.
+    fn xc_db() -> Database {
+        let mut db = Database::new();
+        let root = db.root().id();
+        let mut g = db.group_mut(root).unwrap();
+        let mut e = g.add_entry();
+        e.set_unprotected(fields::TITLE, "xc");
+        e.set_protected(fields::USERNAME, "alice");
+        e.set_protected(fields::PASSWORD, "s3cr3t-pw");
+        e.set_protected("TOTP Seed", "JBSWY3DPEHPK3PXP");
+        e.set_protected("TOTP Settings", "30;6;SHA1");
+        db
+    }
+
+    fn bw_item_no_totp() -> crate::bw::BwItem {
+        crate::bw::BwItem {
+            id: "bw-1".into(),
+            name: "xc".into(),
+            notes: None,
+            favorite: false,
+            folder_id: None,
+            login: Some(crate::bw::BwLogin {
+                username: Some("alice".into()),
+                password: Some("s3cr3t-pw".into()),
+                totp: None,
+                uris: None,
+            }),
+            fields: vec![],
+            revision_date: "r1".into(),
+            deleted_date: None,
+            item_type: 1,
+            reprompt: None,
+        }
+    }
+
+    #[test]
+    fn writeback_preserves_keepassxc_totp_seed_and_settings_when_bw_has_none() {
+        // Regression (2026-11-01 review): the wholesale custom-field
+        // replace used to retain only a field literally named `totp`, so a
+        // writeback of a totp-less BW item silently destroyed a KeePassXC
+        // second factor — and since canonical TOTP then agreed (None on
+        // both sides), no quarantine ever fired.
+        let mut db = xc_db();
+        let (walked, _) = walk(&db);
+        let id = walked
+            .iter()
+            .find(|w| entry_title(&w.entry) == "xc")
+            .unwrap()
+            .id;
+        {
+            let mut e = db.entry_mut(id).unwrap();
+            apply_bw_to_entry(&mut e, &bw_item_no_totp());
+        }
+        assert_eq!(get(&db, "xc", "TOTP Seed"), "JBSWY3DPEHPK3PXP");
+        assert_eq!(get(&db, "xc", "TOTP Settings"), "30;6;SHA1");
+        let (walked, _) = walk(&db);
+        let entry = &walked
+            .iter()
+            .find(|w| entry_title(&w.entry) == "xc")
+            .unwrap()
+            .entry;
+        assert!(extract_totp(entry).is_some(), "seed pair must still extract");
+    }
+
+    #[test]
+    fn writeback_with_bw_totp_supersedes_keepassxc_seed_and_settings() {
+        // Mirror case: when the BW item DOES carry a TOTP, it wins and the
+        // old seed/settings are superseded (the new `totp` field wins
+        // extraction precedence, so keeping stale seed material would be
+        // a second, shadowed copy of a rotated secret).
+        let mut db = xc_db();
+        let (walked, _) = walk(&db);
+        let id = walked
+            .iter()
+            .find(|w| entry_title(&w.entry) == "xc")
+            .unwrap()
+            .id;
+        let mut item = bw_item_no_totp();
+        item.login.as_mut().unwrap().totp = Some("NEWSEED".into());
+        {
+            let mut e = db.entry_mut(id).unwrap();
+            apply_bw_to_entry(&mut e, &item);
+        }
+        assert_eq!(get(&db, "xc", "totp"), "NEWSEED");
+        assert!(
+            get_entry_field(&db, "xc", "TOTP Seed").is_err(),
+            "superseded seed must be gone"
+        );
+        let (walked, _) = walk(&db);
+        let entry = &walked
+            .iter()
+            .find(|w| entry_title(&w.entry) == "xc")
+            .unwrap()
+            .entry;
+        assert_eq!(extract_totp(entry).as_deref(), Some("NEWSEED"));
     }
 
     #[test]

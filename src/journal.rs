@@ -51,10 +51,12 @@ pub type QuarantineRow = (i64, String, Option<String>, Option<String>, String, S
 /// Journal schema version, tracked in SQLite's `user_version` pragma.
 /// v1 is the original schema (mapping / tombstone / quarantine). Journals
 /// written before versioning existed report 0 and are adopted as v1 — the
-/// schema is unchanged, only the stamp is new. Future schema changes bump
-/// this and add a migration step in [`Journal::open`]; a journal stamped
-/// newer than this build understands is refused, never guessed at.
-pub const SCHEMA_VERSION: i32 = 1;
+/// schema is unchanged, only the stamp is new. v2 adds `missing_bw` (first
+/// sightings of mapped items absent from a listing; see `note_missing`).
+/// Future schema changes bump this and add a migration step in
+/// [`Journal::open`]; a journal stamped newer than this build understands
+/// is refused, never guessed at.
+pub const SCHEMA_VERSION: i32 = 2;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -82,13 +84,16 @@ impl Journal {
                 .with_context(|| format!("chmod 0600 {}", path.display()))?;
         }
         // Schema version gate (see SCHEMA_VERSION). Migration scaffold:
-        // match on the stored version, apply each step's DDL, then stamp
-        // the new version. v0 -> v1 is adoption only (identical schema).
+        // any stored version up to SCHEMA_VERSION is accepted; the DDL
+        // below is all CREATE TABLE IF NOT EXISTS, so opening an older
+        // journal applies the missing tables, then the version is
+        // stamped forward. v0 -> v1 was adoption only (identical schema);
+        // v1 -> v2 adds `missing_bw`.
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .context("read journal schema version")?;
         match version {
-            0 | SCHEMA_VERSION => {}
+            v if (0..=SCHEMA_VERSION).contains(&v) => {}
             v if v > SCHEMA_VERSION => {
                 anyhow::bail!(
                     "journal {} has schema version {v}, newer than this build supports ({SCHEMA_VERSION}); upgrade keepass-bw-sync",
@@ -118,10 +123,14 @@ impl Journal {
                  title      TEXT,
                  detail     TEXT NOT NULL,
                  created_at INTEGER NOT NULL,
-                 resolved   INTEGER NOT NULL DEFAULT 0);",
+                 resolved   INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS missing_bw(
+                 bw_id      TEXT PRIMARY KEY,
+                 kp_uuid    TEXT NOT NULL,
+                 first_seen INTEGER NOT NULL);",
         )
         .context("create journal schema")?;
-        if version == 0 {
+        if version != SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                 .context("stamp journal schema version")?;
         }
@@ -199,6 +208,39 @@ impl Journal {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Record a first sighting of a mapped Bitwarden item absent from a
+    /// listing. A single absence may be a transient listing glitch, not a
+    /// delete, so `plan()` only recycles after a second, independent
+    /// listing confirms it (see `was_missing`). Idempotent.
+    pub fn note_missing(&self, bw_id: &str, kp_uuid: &Uuid) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO missing_bw(bw_id, kp_uuid, first_seen) VALUES(?1, ?2, ?3)",
+            params![bw_id, kp_uuid.to_string(), now()],
+        )?;
+        Ok(())
+    }
+
+    /// True when a previous plan already saw this item missing.
+    pub fn was_missing(&self, bw_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM missing_bw WHERE bw_id = ?1",
+            params![bw_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Clear the missing record: the item reappeared (glitch, not a
+    /// delete), or the confirmed recycle was just planned. Clearing on
+    /// plan rather than on apply is fail-safe: if apply then crashes
+    /// before binning, the next run starts the two-listing clock over
+    /// instead of recycling on stale evidence.
+    pub fn clear_missing(&self, bw_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM missing_bw WHERE bw_id = ?1", params![bw_id])?;
+        Ok(())
     }
 
     /// Mappings not covered by a tombstone: the only ones whose Bitwarden
@@ -446,6 +488,31 @@ mod tests {
     fn schema_version_stamped_on_open() {
         let j = test_journal();
         assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v1_journal_migrates_to_v2_with_missing_bw() {
+        // A v1-shaped journal (version 1, no missing_bw table) must open
+        // cleanly, gain the table, and stamp forward to v2 — the
+        // production journal upgrades in place on first run.
+        let p = temp_journal("migrate");
+        {
+            let j = Journal::open(&p).unwrap();
+            assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+        }
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1; DROP TABLE missing_bw;")
+                .unwrap();
+        }
+        let j = Journal::open(&p).unwrap();
+        assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(!j.was_missing("bw-9").unwrap());
+        j.note_missing("bw-9", &test_uuid()).unwrap();
+        assert!(j.was_missing("bw-9").unwrap());
+        j.clear_missing("bw-9").unwrap();
+        assert!(!j.was_missing("bw-9").unwrap());
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

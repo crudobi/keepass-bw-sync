@@ -330,8 +330,13 @@ impl BwClient {
         if !allow_remote {
             validate_loopback_url(base)?;
         }
+        // No redirects, ever: reqwest follows up to 10 by default, and a
+        // 307 from an impersonated `bw serve` would re-send the full
+        // secret payload to another host. `bw serve` never legitimately
+        // redirects, so refusing costs nothing.
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build reqwest client")?;
         Ok(BwClient {
@@ -824,6 +829,52 @@ pub(crate) mod tests {
         let bw = BwClient::new(&base).unwrap();
         let out = bw.trash_item("bw-1", Some("r1")).unwrap();
         assert_eq!(out, TrashOutcome::RevisionChanged);
+    }
+
+    #[test]
+    fn client_does_not_follow_redirects() {
+        // Regression (2026-11-01 review): reqwest follows redirects by
+        // default, so a 307 from an impersonated `bw serve` would re-send
+        // the full secret payload to the Location host. With
+        // Policy::none the 307 surfaces as an error and exactly one
+        // request is ever observed.
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        std::thread::spawn(move || {
+            // Serve up to 2 requests: the first gets the 307, and any
+            // follow-up would be counted (the thread stays alive long
+            // enough for a synchronous redirect to land).
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                c.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr}/redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let bw = BwClient::new(&format!("http://{addr}")).unwrap();
+        let r = bw.list_items();
+        assert!(r.is_err(), "307 must surface as an error, not a redirect");
+        // Grace period: a follower issues the second request synchronously
+        // inside list_items, so by now it would have landed.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "client followed the redirect"
+        );
     }
 
     #[test]

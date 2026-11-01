@@ -8,7 +8,15 @@ is the **source of truth**; the Bitwarden vault is the encrypted offsite copy.
 - **Bitwarden CLI** `bw` on `PATH` (tested with `bw` 2026.9.1) plus a
   Bitwarden account. The engine talks to `bw serve`'s local HTTP API; it
   never contacts bitwarden.com directly.
-- **Rust** stable toolchain (`cargo`, `rustc`).
+- **Rust** stable toolchain (`cargo`, `rustc`), MSRV 1.89 (set by the
+  `keepass` crate; declared as `rust-version` in `Cargo.toml`). Install
+  with rustup if needed:
+  ```sh
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source "$HOME/.cargo/env"
+  ```
+  Note: in a non-interactive SSH session `~/.cargo/bin` is not on `PATH`
+  by default — export it or source the env file above.
 - Linux for the `deploy/systemd/` units (optional — the binary itself is
   portable).
 
@@ -94,6 +102,22 @@ keepass-bw-sync quarantine --journal /path/to/sync.db
 ```
 
 Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
+
+### Bitwarden CLI setup (one time)
+
+The engine only ever talks to a local `bw serve`; it never contacts
+bitwarden.com directly. Get that server running first:
+
+```sh
+bw login            # or: bw login --apikey (headless / 2FA accounts)
+bw unlock           # note the session key
+export BW_SESSION=<key from bw unlock>
+bw serve --port 8087 &
+```
+
+For unattended use, `deploy/systemd/bw-serve.service` automates this
+(headless re-login via API key, 2FA-safe) — see
+[Deployment example](#deployment-example).
 
 ## Recovering from the listing guard
 
@@ -283,7 +307,7 @@ hardened (see checklist).
 
 ```sh
 set -a; source "$SECRETS_DIR/vault.env"; set +a
-cargo run --offline --example mkvault -- "$SECRETS_DIR/vault.kdbx"
+cargo run --example mkvault -- "$SECRETS_DIR/vault.kdbx"
 chmod 600 "$SECRETS_DIR/vault.kdbx"
 ```
 
