@@ -6,9 +6,10 @@ use fs2::FileExt;
 use keepass_bw_sync::bw::BwClient;
 use keepass_bw_sync::journal::Journal;
 use keepass_bw_sync::kdbx::{
-    display_path, extract_entries, get_entry_field, list_entries, open_vault, put_entry,
+    display_path, extract_entries, get_entry_field, list_entries, new_vault, open_vault, put_entry,
     read_secret_input, save_vault, tombstoned_uuids, KdbxVault, NewEntrySpec, PutOutcome,
 };
+use keepass_bw_sync::restore::{check_target_empty, restore_into};
 use keepass_bw_sync::secret::Secret;
 use keepass_bw_sync::sync::{apply, plan, SyncOpts};
 
@@ -44,6 +45,31 @@ enum Cmd {
         /// Create KeePass entries for unmapped Bitwarden items.
         #[arg(long)]
         adopt: bool,
+        /// Allow a non-loopback bw serve URL. The transport is plaintext
+        /// HTTP with no auth: a remote URL exfiltrates vault secrets.
+        #[arg(long)]
+        insecure_remote_url: bool,
+    },
+    /// Rebuild a KeePass vault from Bitwarden. NEVER writes to Bitwarden:
+    /// only the two GET list calls run; stamped items keep their stamp
+    /// UUIDs, unstamped items are adopted under fresh UUIDs (and NOT
+    /// stamped back), trashed items are skipped. Refuses to restore into
+    /// an existing non-empty vault. The new vault's password comes from
+    /// KBS_MASTER_PASSWORD (fail closed when unset); --keyfile is
+    /// supported like the other commands.
+    Restore {
+        /// Path to the KeePass database to create (or an empty vault file).
+        #[arg(long)]
+        kdbx: PathBuf,
+        /// Path to a KeePass keyfile (or set KBS_KEYFILE).
+        #[arg(long, env = "KBS_KEYFILE")]
+        keyfile: Option<PathBuf>,
+        /// Path to the SQLite sync journal to create (created if missing).
+        #[arg(long)]
+        journal: PathBuf,
+        /// Base URL of a running, unlocked `bw serve`.
+        #[arg(long, default_value = "http://127.0.0.1:8087")]
+        bw_url: String,
         /// Allow a non-loopback bw serve URL. The transport is plaintext
         /// HTTP with no auth: a remote URL exfiltrates vault secrets.
         #[arg(long)]
@@ -204,6 +230,25 @@ fn open_cli_vault(kdbx: &std::path::Path, keyfile: &Option<PathBuf>) -> Result<K
     Ok(vault)
 }
 
+/// Restore's vault password: `KBS_MASTER_PASSWORD` only, fail closed
+/// when unset. Unlike the other commands, restore never falls back to an
+/// interactive prompt: a restore creates a *new* vault, and a mistyped or
+/// defaulted password would lock the user out of the recovery they just
+/// made (or, worse, silently reuse a terminal-entered password they did
+/// not intend as the new vault's password).
+fn restore_master_password() -> Result<Secret> {
+    match std::env::var("KBS_MASTER_PASSWORD") {
+        Ok(pw) if !pw.is_empty() => {
+            let pw = zeroize::Zeroizing::new(pw);
+            Ok(Secret::from_str(pw.as_str()))
+        }
+        _ => anyhow::bail!(
+            "KBS_MASTER_PASSWORD is not set (or is empty); restore refuses to invent a vault \
+             password — set it to the new vault's master password and re-run"
+        ),
+    }
+}
+
 fn master_password() -> Result<Secret> {
     // Zeroizing wrapper: the intermediate String is wiped on drop instead of
     // lingering in allocator memory.
@@ -286,6 +331,53 @@ fn main() -> Result<()> {
             if report.quarantined > 0 || quarantine_pending > 0 {
                 println!("review: keepass-bw-sync quarantine --journal <path>");
             }
+        }
+        Cmd::Restore {
+            kdbx,
+            keyfile,
+            journal,
+            bw_url,
+            insecure_remote_url,
+        } => {
+            let _lock = acquire_journal_lock(&journal)?;
+
+            let pw = restore_master_password()?;
+            let kf = load_keyfile(&keyfile)?;
+            // Target safety BEFORE any Bitwarden traffic or journal write:
+            // a nonexistent path or a zero-byte file becomes a brand-new
+            // vault; an existing vault must be empty, else refuse.
+            let mut vault = if std::fs::metadata(&kdbx).map(|m| m.len()).unwrap_or(0) == 0 {
+                new_vault(&kdbx, &pw, kf.as_deref())
+            } else {
+                open_vault(&kdbx, &pw, kf.as_deref())?
+            };
+            drop(pw);
+            vault.require_writable()?;
+            check_target_empty(&vault.db)?;
+
+            // GETs only, and deliberately no `bw.sync()`: restore must not
+            // mutate Bitwarden in any way, and a POST /sync is not a read.
+            // The restore module takes only the fetched slices — it has no
+            // client handle, so no Bitwarden write can originate from it.
+            let bw = BwClient::new_with_remote(&bw_url, insecure_remote_url)?;
+            let items = bw
+                .list_items()
+                .context("bw list items failed — is `bw serve` running and unlocked?")?;
+            let folders = bw.list_folders().context("list bitwarden folders")?;
+            let (report, journal_ops) = restore_into(&mut vault.db, &items, &folders)?;
+            // Journal opens (creating it when missing) only after the
+            // restore computed cleanly in memory; the vault saves before
+            // the journal commits, same ordering as sync.
+            let journal = Journal::open(&journal)?;
+            save_vault(&vault)?;
+            println!("keepass database saved (atomic temp+rename)");
+            journal
+                .apply_ops(&journal_ops)
+                .context("commit journal ops")?;
+            println!(
+                "restored stamped={} unstamped={} skipped_trashed={}",
+                report.stamped, report.unstamped, report.skipped_trashed
+            );
         }
         Cmd::Quarantine { journal, action } => {
             let j = Journal::open(&journal)?;

@@ -64,6 +64,19 @@ pub fn open_vault(path: &Path, password: &Secret, keyfile: Option<&[u8]>) -> Res
     })
 }
 
+/// A brand-new, empty in-memory vault bound to `path` and the given
+/// credentials, ready for [`save_vault`]. Used by `restore` for a target
+/// path that does not exist (or exists but is zero bytes): the first save
+/// writes it as a KDBX4 vault, owner-only (see [`save_vault`]).
+pub fn new_vault(path: &Path, password: &Secret, keyfile: Option<&[u8]>) -> KdbxVault {
+    KdbxVault {
+        db: Database::new(),
+        password: Secret::new(password.expose().to_vec()),
+        keyfile: keyfile.map(|k| k.to_vec()),
+        path: path.to_path_buf(),
+    }
+}
+
 impl KdbxVault {
     /// Gate for write paths (sync, put): call right after open, BEFORE any
     /// Bitwarden write or stamp. The keepass crate's writer emits KDBX4
@@ -357,12 +370,34 @@ pub fn adopt_bw_entry(
     item: &crate::bw::BwItem,
     folder_name: Option<&str>,
 ) -> Result<Uuid> {
+    adopt_bw_entry_with_uuid(db, item, folder_name, None)
+}
+
+/// Create a KeePass entry from Bitwarden-side content (adopt path), with
+/// an explicit UUID when given.
+///
+/// `None` mints a fresh random UUID (the sync `--adopt` path). `Some`
+/// pins the entry to that UUID — the restore path uses the item's
+/// `KBS_SYNC_ID` stamp, which is the entry's true identity: restoring
+/// under a fresh UUID would orphan the stamp and the next sync would
+/// quarantine the item as `orphan_bw_stamp` instead of matching it.
+pub fn adopt_bw_entry_with_uuid(
+    db: &mut Database,
+    item: &crate::bw::BwItem,
+    folder_name: Option<&str>,
+    uuid: Option<Uuid>,
+) -> Result<Uuid> {
     let gid = match folder_name {
         Some(name) if !name.is_empty() => find_or_create_group(db, name)?,
         _ => db.root().id(),
     };
     let mut group = db.group_mut(gid).context("adopt target group vanished")?;
-    let mut e = group.add_entry();
+    let mut e = match uuid {
+        Some(u) => group
+            .add_entry_with_id(EntryId::from_uuid(u))
+            .with_context(|| format!("adopt entry with pinned UUID {u}"))?,
+        None => group.add_entry(),
+    };
     e.set_unprotected(fields::TITLE, item.name.clone());
     let login = item.login.clone().unwrap_or_default();
     let uri_strings = login.uri_strings();

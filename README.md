@@ -112,26 +112,77 @@ history and tombstones preserved for forensics).
 
 ## Restoring from Bitwarden
 
-The honest state of restore support, as verified by drill (2026-11-01):
+When the local vault is gone, rebuild it from Bitwarden with `restore`.
+It reuses the proven adoption code (`adopt_bw_entry`: folder → group,
+TOTP, all URIs, typed custom fields), and it writes a fresh journal so
+the restored vault syncs cleanly afterwards.
 
-- `sync --adopt` does **not** restore engine-managed (stamped) items into
-  an empty vault. By design, a stamped item whose KeePass entry is missing
-  quarantines as `orphan_bw_stamp` — adopting it would mint a phantom
-  identity — and `--adopt` only covers *unstamped* items, which it then
-  stamps back onto Bitwarden (a write). Do not point `sync --adopt` at a
-  scratch vault expecting a restore; it restores nothing and mutates the
-  unstamped items.
-- The verified restore path is the library's own adoption code, read-only
-  against Bitwarden: list items + folders via `bw serve` (GETs only),
-  `adopt_bw_entry` each login item into a fresh database (folder →
-  group), save. No journal, no Bitwarden writes, no production vault
-  touched. Drill result: 25/25 live items restored, 24/24 production
-  titles present (the one extra was a Bitwarden-only item), 121/121
-  field-value hashes matched between the restored and production vaults,
-  and KeePassXC opens the restored vault. Bitwarden revision state was
-  identical before and after, proving zero writes.
-- A one-command `restore` subcommand (this procedure, built in) is the
-  remaining gap; until it exists, the drill above is the procedure.
+```sh
+KBS_MASTER_PASSWORD='...' keepass-bw-sync restore \
+  --kdbx /path/to/restored.kdbx \
+  --journal /path/to/restored-sync.db
+# --bw-url http://127.0.0.1:8087 (default) and --keyfile are supported
+# like the other commands; --insecure-remote-url opts out of the
+# loopback guard, same as for sync.
+```
+
+What it restores:
+
+- **Stamped items** (engine-managed, carrying `KBS_SYNC_ID`) under their
+  stamp UUID — that UUID is the entry's true identity, so the next sync
+  matches them instead of quarantining them as `orphan_bw_stamp`.
+- **Unstamped items** (Bitwarden-only) too, under freshly minted UUIDs —
+  a restore that dropped them would be incomplete.
+- **Trashed items are NOT restored** (`deletedDate` set in Bitwarden).
+- The new journal maps uuid → Bitwarden id with the `KBS_SYNC_HASH`
+  stamp as baseline when present, else the live content hash (the M1
+  rule). A subsequent `sync` against the restored vault + new journal +
+  the same Bitwarden state plans **0 actions**.
+
+No-Bitwarden-writes guarantee: restore issues only the two GET list
+calls (`list_items`, `list_folders`) — no `bw sync` POST, no creates,
+edits, trash, or stamps. Unstamped items are deliberately NOT stamped
+back: stamping would be a Bitwarden write, and restore must not mutate
+the source it is recovering from.
+
+Unstamped-orphan caveat (stated, not silent): because unstamped items
+are not stamped back, their only identity record is the new journal. If
+that journal is later lost, those items are orphans again — a later
+`sync --adopt` would re-adopt them under yet another UUID rather than
+matching them. Stamped items do not have this problem: their identity
+survives in the Bitwarden stamp itself. Back up the journal with the
+vault.
+
+Target safety: the normal case is a brand-new vault at a nonexistent
+path; restoring into an explicitly empty vault file is also allowed.
+Restore **refuses** an existing non-empty vault (fail closed, clear
+error) — it never merges into a live vault. The new vault's password
+comes from `KBS_MASTER_PASSWORD` only; restore fails closed when it is
+unset and never falls back to an interactive prompt, so a mistyped
+password cannot silently lock you out of the recovery you just made.
+
+Verification steps after a restore:
+
+1. `keepass-bw-sync list --kdbx /path/to/restored.kdbx` shows the
+   expected `group/title` inventory (titles only, no values).
+2. Open the restored vault in KeePassXC with the password from
+   `KBS_MASTER_PASSWORD` and spot-check an entry's fields.
+3. `keepass-bw-sync sync --kdbx /path/to/restored.kdbx --journal
+   /path/to/restored-sync.db` plans 0 actions against unchanged
+   Bitwarden state.
+4. Confirm Bitwarden itself is untouched: its revision state is
+   identical before and after (restore performs no writes there).
+
+Background: a 2026-11-01 restore drill proved the data round-trips
+before this subcommand existed — 25/25 live items restored, 24/24
+production titles present (the one extra was a Bitwarden-only item),
+121/121 field-value hashes matched, KeePassXC opened the restored
+vault, zero Bitwarden writes. Note that `sync --adopt` is still NOT a
+restore path: a stamped item whose KeePass entry is missing quarantines
+as `orphan_bw_stamp` by design (adopting it would mint a phantom
+identity), and `--adopt` stamps unstamped items back onto Bitwarden (a
+write). Use `restore` for recovery; use `sync --adopt` only for
+adopting new Bitwarden items into an existing, live vault.
 
 ## Deployment example
 

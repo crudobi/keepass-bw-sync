@@ -14,4 +14,5 @@ pub mod canonical;
 pub mod kdbx;
 pub mod bw;
 pub mod journal;
+pub mod restore;
 pub mod sync;
