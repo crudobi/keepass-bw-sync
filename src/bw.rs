@@ -7,6 +7,10 @@
 //!
 //! Writes use optimistic concurrency: [`BwClient::edit_item`] re-reads the
 //! item's `revisionDate` and aborts when it moved under us.
+//!
+//! Rate-limited responses (HTTP 429, or 400s embedding an upstream 429)
+//! are retried with backoff; creates, folders, and deletes re-check server
+//! state before re-issuing, so a retry can never duplicate or double-delete.
 
 use std::time::Duration;
 
@@ -233,6 +237,44 @@ struct Created {
     id: String,
 }
 
+/// Rate-limit retries for `bw serve` calls.
+///
+/// Bitwarden rate-limits cipher writes; when the limit trips, `bw serve`
+/// answers either HTTP 429 directly or — as observed 2026-10-15 — HTTP 400
+/// whose message embeds the upstream `status code 429 Too Many Requests`
+/// text (with a `Try again in Ns` hint). Both shapes retry; anything else
+/// fails exactly as before.
+///
+/// Delay: the parsed hint when present (capped at 30s), else exponential
+/// backoff 1s, 2s, 4s, 8s, … capped at 30s. At most 5 attempts per call.
+/// Retries are safe by construction: GETs are idempotent, PUTs re-send an
+/// identical full-replace payload, and creates/folders/trashes re-check
+/// server state before re-issuing (see `create_item`, `create_folder`,
+/// `trash_item`).
+const MAX_ATTEMPTS: usize = 5;
+const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// Delay before retry number `retry` (1-based: the first retry is 1), or
+/// `None` when this response is not a rate limit.
+fn rate_limit_delay(status: reqwest::StatusCode, body: &[u8], retry: usize) -> Option<Duration> {
+    let text = String::from_utf8_lossy(body);
+    let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || text.contains("status code 429")
+        || text.contains("Too Many Requests");
+    if !limited {
+        return None;
+    }
+    if let Some(pos) = text.find("Try again in ") {
+        let rest = &text[pos + "Try again in ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            return Some(Duration::from_secs(secs).min(BACKOFF_CAP));
+        }
+    }
+    let secs = 1u64 << retry.saturating_sub(1); // 1, 2, 4, 8, …
+    Some(Duration::from_secs(secs).min(BACKOFF_CAP))
+}
+
 fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -298,10 +340,74 @@ impl BwClient {
         })
     }
 
-    /// Unwrap `{"success":true,"data":...}` envelopes; tolerate raw bodies.
-    fn unwrap<T: for<'de> Deserialize<'de>>(&self, resp: reqwest::blocking::Response) -> Result<T> {
+    /// One HTTP exchange: send a freshly built request and return the raw
+    /// (status, body). `send_ctx`/`parse_ctx` are the caller's original
+    /// error contexts, so error strings are unchanged from the pre-retry
+    /// code. Does not itself retry; see `exchange_retry`.
+    fn exchange_once<F>(
+        &self,
+        send_ctx: &str,
+        parse_ctx: &str,
+        build: F,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)>
+    where
+        F: FnOnce() -> reqwest::blocking::RequestBuilder,
+    {
+        let resp = build().send().with_context(|| send_ctx.to_string())?;
         let status = resp.status();
-        let v: serde_json::Value = resp.json().context("parse bw serve response")?;
+        let bytes = resp.bytes().with_context(|| parse_ctx.to_string())?.to_vec();
+        Ok((status, bytes))
+    }
+
+    /// `exchange_once` with rate-limit retries. Returns the final response
+    /// (success or not) for the caller to gate; a rate limit that survives
+    /// all attempts surfaces through the caller's normal error path.
+    /// Transport errors are not retried.
+    fn exchange_retry<F>(
+        &self,
+        send_ctx: &str,
+        parse_ctx: &str,
+        mut build: F,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)>
+    where
+        F: FnMut() -> reqwest::blocking::RequestBuilder,
+    {
+        for attempt in 0..MAX_ATTEMPTS {
+            let (status, bytes) = self.exchange_once(send_ctx, parse_ctx, &mut build)?;
+            match rate_limit_delay(status, &bytes, attempt + 1) {
+                Some(delay) if attempt + 1 < MAX_ATTEMPTS => {
+                    std::thread::sleep(delay);
+                }
+                _ => return Ok((status, bytes)),
+            }
+        }
+        unreachable!("loop returns on the final attempt")
+    }
+
+    /// Exchange + parse for the `unwrap`-style endpoints (list/get/create):
+    /// parse failures carry the original "parse bw serve response" context.
+    fn get_parsed<F>(
+        &self,
+        send_ctx: &str,
+        build: F,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)>
+    where
+        F: FnMut() -> reqwest::blocking::RequestBuilder,
+    {
+        let (status, bytes) = self.exchange_retry(send_ctx, "parse bw serve response", build)?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).context("parse bw serve response")?;
+        Ok((status, v))
+    }
+
+    /// Unwrap `{"success":true,"data":...}` envelopes; tolerate raw bodies.
+    /// Takes the already-read (status, body) so callers can retry the
+    /// exchange before gating; error strings match the old Response-based
+    /// version exactly.
+    fn unwrap<T: for<'de> Deserialize<'de>>(
+        &self,
+        status: reqwest::StatusCode,
+        v: serde_json::Value,
+    ) -> Result<T> {
         if !status.is_success() {
             bail!("bw serve HTTP {}: {}", status, serve_message(&v));
         }
@@ -316,51 +422,60 @@ impl BwClient {
     }
 
     pub fn sync(&self) -> Result<()> {
-        let resp = self
-            .http
-            .post(format!("{}/sync", self.base))
-            .send()
-            .context("POST /sync")?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().context("parse /sync")?;
+        let (status, bytes) = self.exchange_retry("POST /sync", "parse /sync", || {
+            self.http.post(format!("{}/sync", self.base))
+        })?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).context("parse /sync")?;
         check_serve_ok(status, &v, "sync")
     }
 
     pub fn list_items(&self) -> Result<Vec<BwItem>> {
-        let resp = self
-            .http
-            .get(format!("{}/list/object/items", self.base))
-            .send()
-            .context("GET items")?;
-        self.unwrap(resp)
+        let (status, v) = self.get_parsed("GET items", || {
+            self.http.get(format!("{}/list/object/items", self.base))
+        })?;
+        self.unwrap(status, v)
     }
 
     pub fn get_item(&self, id: &str) -> Result<BwItem> {
-        let resp = self
-            .http
-            .get(format!("{}/object/item/{}", self.base, id))
-            .send()
-            .with_context(|| format!("GET item {}", id))?;
-        self.unwrap(resp)
+        let (status, v) = self.get_parsed(&format!("GET item {id}"), || {
+            self.http.get(format!("{}/object/item/{}", self.base, id))
+        })?;
+        self.unwrap(status, v)
     }
 
     pub fn list_folders(&self) -> Result<Vec<BwFolder>> {
-        let resp = self
-            .http
-            .get(format!("{}/list/object/folders", self.base))
-            .send()
-            .context("GET folders")?;
-        self.unwrap(resp)
+        let (status, v) = self.get_parsed("GET folders", || {
+            self.http.get(format!("{}/list/object/folders", self.base))
+        })?;
+        self.unwrap(status, v)
     }
 
     pub fn create_folder(&self, name: &str) -> Result<String> {
-        let resp = self
-            .http
-            .post(format!("{}/object/folder", self.base))
-            .json(&serde_json::json!({ "name": name }))
-            .send()
-            .context("POST folder")?;
-        Ok(self.unwrap::<Created>(resp)?.id)
+        for attempt in 0..MAX_ATTEMPTS {
+            let (status, bytes) = self.exchange_once("POST folder", "parse bw serve response", || {
+                self.http
+                    .post(format!("{}/object/folder", self.base))
+                    .json(&serde_json::json!({ "name": name }))
+            })?;
+            match rate_limit_delay(status, &bytes, attempt + 1) {
+                Some(delay) if attempt + 1 < MAX_ATTEMPTS => {
+                    // A 429 may mean the folder already exists: re-list and
+                    // reuse it rather than creating a same-named duplicate.
+                    if let Ok(folders) = self.list_folders() {
+                        if let Some(f) = folders.iter().find(|f| f.name == name) {
+                            return Ok(f.id.clone());
+                        }
+                    }
+                    std::thread::sleep(delay);
+                }
+                _ => {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&bytes).context("parse bw serve response")?;
+                    return Ok(self.unwrap::<Created>(status, v)?.id);
+                }
+            }
+        }
+        unreachable!("loop returns on the final attempt")
     }
 
     /// Build the `bw create/edit item` payload. The password is copied into a
@@ -429,13 +544,38 @@ impl BwClient {
     ) -> Result<String> {
         let hash = entry.content_hash_hex();
         let payload = Self::item_payload(entry, folder_id, &hash, None);
-        let resp = self
-            .http
-            .post(format!("{}/object/item", self.base))
-            .json(&payload)
-            .send()
-            .context("POST item")?;
-        Ok(self.unwrap::<Created>(resp)?.id)
+        for attempt in 0..MAX_ATTEMPTS {
+            let (status, bytes) = self.exchange_once("POST item", "parse bw serve response", || {
+                self.http
+                    .post(format!("{}/object/item", self.base))
+                    .json(&payload)
+            })?;
+            match rate_limit_delay(status, &bytes, attempt + 1) {
+                Some(delay) if attempt + 1 < MAX_ATTEMPTS => {
+                    // A 429 may mean the create already landed: the payload
+                    // carries the KBS_SYNC_ID stamp, so a re-list that finds
+                    // it is proof — return that id, never blindly re-create.
+                    // (A create that landed before its stamp call is a
+                    // different window; it surfaces later as an
+                    // unmapped-bw-item quarantine, never silent corruption.)
+                    if let Ok(items) = self.list_items() {
+                        if let Some(it) = items.iter().find(|i| {
+                            !i.trashed()
+                                && i.stamps().0.as_deref() == Some(&entry.uuid.to_string())
+                        }) {
+                            return Ok(it.id.clone());
+                        }
+                    }
+                    std::thread::sleep(delay);
+                }
+                _ => {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&bytes).context("parse bw serve response")?;
+                    return Ok(self.unwrap::<Created>(status, v)?.id);
+                }
+            }
+        }
+        unreachable!("loop returns on the final attempt")
     }
 
     /// Optimistic-concurrency edit: when `revisionDate` moved between plan
@@ -443,6 +583,8 @@ impl BwClient {
     /// is returned so the caller can quarantine just that item — the same
     /// graceful handling `trash_item` has always had — instead of aborting
     /// the whole run and discarding every other action's journal commit.
+    /// The PUT is a full replace with an identical payload, so a retried PUT
+    /// after a 429 is a content no-op.
     pub fn edit_item(
         &self,
         id: &str,
@@ -456,14 +598,12 @@ impl BwClient {
         }
         let hash = entry.content_hash_hex();
         let payload = Self::item_payload(entry, folder_id, &hash, Some(&cur));
-        let resp = self
-            .http
-            .put(format!("{}/object/item/{}", self.base, id))
-            .json(&payload)
-            .send()
-            .with_context(|| format!("PUT item {}", id))?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().context("parse PUT item")?;
+        let (status, bytes) = self.exchange_retry(&format!("PUT item {id}"), "parse PUT item", || {
+            self.http
+                .put(format!("{}/object/item/{}", self.base, id))
+                .json(&payload)
+        })?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).context("parse PUT item")?;
         check_serve_ok(status, &v, "edit")?;
         Ok(EditOutcome::Updated)
     }
@@ -478,15 +618,32 @@ impl BwClient {
                 return Ok(TrashOutcome::RevisionChanged);
             }
         }
-        let resp = self
-            .http
-            .delete(format!("{}/object/item/{}", self.base, id))
-            .send()
-            .with_context(|| format!("DELETE item {}", id))?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().context("parse DELETE item")?;
-        check_serve_ok(status, &v, "delete")?;
-        Ok(TrashOutcome::Trashed)
+        for attempt in 0..MAX_ATTEMPTS {
+            let (status, bytes) =
+                self.exchange_once(&format!("DELETE item {id}"), "parse DELETE item", || {
+                    self.http.delete(format!("{}/object/item/{}", self.base, id))
+                })?;
+            match rate_limit_delay(status, &bytes, attempt + 1) {
+                Some(delay) if attempt + 1 < MAX_ATTEMPTS => {
+                    // A 429 may mean the delete already landed: re-read; a
+                    // trashed item is proof, so return Trashed rather than
+                    // deleting twice.
+                    if let Ok(cur) = self.get_item(id) {
+                        if cur.trashed() {
+                            return Ok(TrashOutcome::Trashed);
+                        }
+                    }
+                    std::thread::sleep(delay);
+                }
+                _ => {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&bytes).context("parse DELETE item")?;
+                    check_serve_ok(status, &v, "delete")?;
+                    return Ok(TrashOutcome::Trashed);
+                }
+            }
+        }
+        unreachable!("loop returns on the final attempt")
     }
 
     /// Stamp `KBS_SYNC_ID` / `KBS_SYNC_HASH` onto an existing item (adopt
@@ -534,14 +691,13 @@ impl BwClient {
                 "uris": uris,
             },
         });
-        let resp = self
-            .http
-            .put(format!("{}/object/item/{}", self.base, id))
-            .json(&payload)
-            .send()
-            .with_context(|| format!("PUT stamp item {}", id))?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().context("parse PUT stamp item")?;
+        let (status, bytes) =
+            self.exchange_retry(&format!("PUT stamp item {id}"), "parse PUT stamp item", || {
+                self.http
+                    .put(format!("{}/object/item/{}", self.base, id))
+                    .json(&payload)
+            })?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).context("parse PUT stamp item")?;
         check_serve_ok(status, &v, "stamp")
     }
 }
@@ -879,5 +1035,153 @@ pub(crate) mod tests {
         // Garbage is garbage.
         assert!(BwClient::new("not a url").is_err());
         assert!(BwClient::new("127.0.0.1:8087").is_err());
+    }
+
+    /// Plain 429 body with a retry hint.
+    fn rate_limited_429_body() -> String {
+        r#"{"success":false,"message":"Slow down! Too many requests. Try again in 1s."}"#.into()
+    }
+
+    /// The October 2026 shape: HTTP 400 whose message embeds the upstream
+    /// 429 (CreateCipherError) with a retry hint.
+    fn wrapped_429_body() -> String {
+        r#"{"success":false,"message":"CreateCipherError: error in response: status code 429 Too Many Requests: {\"object\":\"error\",\"message\":\"Slow down! Too many requests. Try again in 1s.\"}"}"#.into()
+    }
+
+    #[test]
+    fn rate_limit_delay_parses_hint_status_and_backoff() {
+        use reqwest::StatusCode;
+        // Pure 429 with a hint honors the hint.
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, rate_limited_429_body().as_bytes(), 1),
+            Some(Duration::from_secs(1))
+        );
+        // The hint is capped at 30s.
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, b"Try again in 60s", 1),
+            Some(Duration::from_secs(30))
+        );
+        // Wrapped 400 (the observed Bitwarden shape) is also a limit, and
+        // the hint wins over the backoff sequence.
+        assert_eq!(
+            rate_limit_delay(StatusCode::BAD_REQUEST, wrapped_429_body().as_bytes(), 3),
+            Some(Duration::from_secs(1))
+        );
+        // Exponential backoff without a hint.
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, b"Slow down!", 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, b"Slow down!", 3),
+            Some(Duration::from_secs(4))
+        );
+        // Anything else is not a rate limit.
+        assert_eq!(
+            rate_limit_delay(StatusCode::INTERNAL_SERVER_ERROR, b"boom", 1),
+            None
+        );
+        assert_eq!(rate_limit_delay(StatusCode::OK, b"{}", 1), None);
+    }
+
+    #[test]
+    fn get_item_retries_on_429_then_succeeds() {
+        let base = stub_server(vec![
+            ("GET /object/item/bw-1 ".into(), 429, rate_limited_429_body()),
+            ("GET /object/item/bw-1 ".into(), 200, item_json("r1")),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let it = bw.get_item("bw-1").unwrap();
+        assert_eq!(it.revision_date, "r1");
+    }
+
+    #[test]
+    fn create_item_returns_existing_id_when_create_landed_before_429() {
+        // The create reached the server (stamp included) but the response
+        // came back 429: the client must re-list, find the stamped item,
+        // and return its id — never issue a second create. The stub serves
+        // exactly two responses, so a second POST would fail the test.
+        let nil = uuid::Uuid::nil().to_string();
+        let listed = serde_json::json!({
+            "success": true,
+            "data": {"object": "list", "data": [{
+                "id": "bw-landed", "name": "t", "notes": null, "favorite": false,
+                "folderId": null, "type": 1, "reprompt": 0,
+                "login": {"username": "u", "password": "p", "totp": null, "uris": []},
+                "fields": [{"name": "KBS_SYNC_ID", "value": nil, "type": 0}],
+                "revisionDate": "r1", "deletedDate": null
+            }]}
+        })
+        .to_string();
+        let base = stub_server(vec![
+            ("POST /object/item ".into(), 400, wrapped_429_body()),
+            ("GET /list/object/items ".into(), 200, listed),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let id = bw.create_item(&entry(), None).unwrap();
+        assert_eq!(id, "bw-landed");
+    }
+
+    #[test]
+    fn create_item_retries_post_when_429_and_nothing_landed() {
+        // POST 429s, the re-list finds nothing stamped, so the create is
+        // re-issued and succeeds.
+        let empty_list = serde_json::json!({
+            "success": true,
+            "data": {"object": "list", "data": []}
+        })
+        .to_string();
+        let base = stub_server(vec![
+            ("POST /object/item ".into(), 429, rate_limited_429_body()),
+            ("GET /list/object/items ".into(), 200, empty_list),
+            (
+                "POST /object/item ".into(),
+                200,
+                r#"{"success":true,"data":{"id":"bw-new"}}"#.into(),
+            ),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let id = bw.create_item(&entry(), None).unwrap();
+        assert_eq!(id, "bw-new");
+    }
+
+    #[test]
+    fn create_folder_reuses_existing_folder_on_429() {
+        let folders = serde_json::json!({
+            "success": true,
+            "data": {"object": "list", "data": [{"id": "f-1", "name": "Ops"}]}
+        })
+        .to_string();
+        let base = stub_server(vec![
+            ("POST /object/folder ".into(), 429, rate_limited_429_body()),
+            ("GET /list/object/folders ".into(), 200, folders),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let id = bw.create_folder("Ops").unwrap();
+        assert_eq!(id, "f-1");
+    }
+
+    #[test]
+    fn trash_item_returns_trashed_when_delete_landed_before_429() {
+        // The DELETE reached the server but the response came back 429:
+        // the re-read finds the item trashed, so no second DELETE issues.
+        let trashed = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": "bw-1", "name": "t", "notes": null, "favorite": false,
+                "folderId": null, "type": 1, "reprompt": 0,
+                "login": null, "fields": [],
+                "revisionDate": "r1", "deletedDate": "2026-01-01T00:00:00.000Z"
+            }
+        })
+        .to_string();
+        let base = stub_server(vec![
+            ("GET /object/item/bw-1 ".into(), 200, item_json("r1")),
+            ("DELETE /object/item/bw-1 ".into(), 429, rate_limited_429_body()),
+            ("GET /object/item/bw-1 ".into(), 200, trashed),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let out = bw.trash_item("bw-1", Some("r1")).unwrap();
+        assert_eq!(out, TrashOutcome::Trashed);
     }
 }

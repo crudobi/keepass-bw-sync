@@ -56,13 +56,28 @@ on loopback (fine single-user; seal or socket it on multi-user boxes).
 - **Conflicts:** KeePass-wins by policy. Foreign Bitwarden edits (hash ≠
   `KBS_SYNC_HASH` stamp) **quarantine** for human review — never silently
   overwritten. `--writeback` applies them into KeePass (loser preserved in
-  entry history); `--force` lets KeePass overwrite them. Concurrent edits on
-  both sides always quarantine: no automatic merge for secrets.
+  entry history); `--force` lets KeePass overwrite them. Genuine concurrent
+  edits (both sides changed to *different* content) quarantine by default
+  and honor the same two flags; when both sides changed to the *same*
+  content — e.g. after a crash between a Bitwarden write and the journal
+  commit — the watermark simply refreshes instead of quarantining two
+  agreeing copies.
 - **Deletes:** propagate only into the other side's *recoverable* bin
   (Bitwarden trash ↔ KeePass recycle bin). KDBX `DeletedObject` tombstones
   are honored; nothing auto-resurrects, so deletes stay deleted.
 - **Writes to Bitwarden** are optimistic-concurrency: the item's
   `revisionDate` is re-read and the write aborts on mismatch.
+- **Fidelity:** placement syncs both ways (top-level KeePass group ↔
+  Bitwarden folder; adopted entries land in the group named by their
+  folder). Custom-field types ride through (hidden stays hidden), every
+  URI round-trips (first in the URL field, the rest in `URL <n>` fields),
+  and the favorite flag and URI match strategies survive edits.
+- **Rate limits** are retried, not fatal: HTTP 429 — including 400s that
+  embed an upstream 429 — backs off (parsed `Try again in Ns` hint, else
+  exponential 1s→30s, max 5 attempts). Creates, folders, and deletes
+  re-check server state before re-issuing, so a retry can never duplicate
+  an item or delete twice; a limit that survives all attempts fails the
+  run without committing anything, and the next run reconciles.
 
 ## Usage
 
@@ -94,6 +109,29 @@ keepass-bw-sync journal reset --journal /path/to/sync.db
 
 The old journal is archived to `sync.bak-<unix-timestamp>` (quarantine
 history and tombstones preserved for forensics).
+
+## Restoring from Bitwarden
+
+The honest state of restore support, as verified by drill (2026-11-01):
+
+- `sync --adopt` does **not** restore engine-managed (stamped) items into
+  an empty vault. By design, a stamped item whose KeePass entry is missing
+  quarantines as `orphan_bw_stamp` — adopting it would mint a phantom
+  identity — and `--adopt` only covers *unstamped* items, which it then
+  stamps back onto Bitwarden (a write). Do not point `sync --adopt` at a
+  scratch vault expecting a restore; it restores nothing and mutates the
+  unstamped items.
+- The verified restore path is the library's own adoption code, read-only
+  against Bitwarden: list items + folders via `bw serve` (GETs only),
+  `adopt_bw_entry` each login item into a fresh database (folder →
+  group), save. No journal, no Bitwarden writes, no production vault
+  touched. Drill result: 25/25 live items restored, 24/24 production
+  titles present (the one extra was a Bitwarden-only item), 121/121
+  field-value hashes matched between the restored and production vaults,
+  and KeePassXC opens the restored vault. Bitwarden revision state was
+  identical before and after, proving zero writes.
+- A one-command `restore` subcommand (this procedure, built in) is the
+  remaining gap; until it exists, the drill above is the procedure.
 
 ## Deployment example
 
@@ -185,8 +223,7 @@ hardened (see checklist).
 4. `sudo systemctl enable --now bw-serve.service kbs-sync.timer`
 5. Migrate secrets into the vault one by one, verifying each with
    `keepass-bw-sync get`.
-6. Run a restore drill: fresh host, `bw` login, export, rebuild — before
-   trusting the offsite copy.
+6. Run a restore drill ([Restoring from Bitwarden](#restoring-from-bitwarden)) before trusting the offsite copy.
 
 ### One-off vault init
 
@@ -204,6 +241,9 @@ chmod 600 "$SECRETS_DIR/vault.kdbx"
 - **No attachment sync** (see Roadmap): large secrets such as SSH private
   keys are stored as text in notes fields. It works, but it is clunky for
   many or large files.
+- **Sustained Bitwarden rate limits** still fail a run after 5 backoff
+  attempts — safely (nothing commits, the next run reconciles) — but a
+  bulk first-sync against a throttled account may need a second run.
 - **`bw serve` is loopback-only plaintext HTTP by design.**
   `--insecure-remote-url` exists for exotic setups, but a remote URL
   exfiltrates vault secrets — only ever point it at hosts you fully trust.
@@ -214,7 +254,7 @@ chmod 600 "$SECRETS_DIR/vault.kdbx"
 
 - `src/secret.rs` — zeroized secret newtype
 - `src/canonical.rs` — canonical entry model + content hashing
-- `src/kdbx.rs` — open/walk/save .kdbx (keepass-rs)
+- `src/kdbx.rs` — open/walk/save .kdbx (keepass 0.15)
 - `src/bw.rs` — `bw serve` client with revision guards
 - `src/journal.rs` — SQLite mappings, tombstones, quarantine
 - `src/sync.rs` — plan/apply engine + unit tests
