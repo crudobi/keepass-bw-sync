@@ -57,6 +57,9 @@ pub enum Action {
     /// the apply arm records that reason in the tombstone side
     /// (`"bitwarden-absence"`), so the deleted branch can tell an
     /// absence-recycle whose item reappeared from a genuine user bin.
+    /// A trashed-arm recycle records side `"bitwarden-trash"` (legacy
+    /// spelling `"bitwarden"`) for the same reason: an item the user
+    /// untrashes unchanged must quarantine, never re-trash.
     RecycleKp { kp_uuid: Uuid, bw_id: String, from_absence: bool },
     /// Unmapped, unstamped Bitwarden item: adopt as a new KeePass entry
     /// (only with --adopt), then stamp KBS_SYNC_ID back onto the BW item.
@@ -104,6 +107,22 @@ fn top_group(group_path: &str) -> &str {
     group_path.split('/').next().unwrap_or("")
 }
 
+/// Tombstone sides the engine itself records for recycles it initiated.
+/// These are NON-completions, unlike a user bin: a binned entry whose
+/// item reappeared must quarantine, never trash, and a permanently
+/// deleted entry whose item is live must still propagate its delete.
+/// `"bitwarden"` is the legacy spelling of `"bitwarden-trash"`,
+/// recorded by trashed-arm recycles before the rename; readers treat
+/// both identically. Completed propagations are `"keepass"` (user bin
+/// trashed, or tombstone-arm completion) and `"both"` (both sides
+/// deleted); only those skip the tombstone arm.
+fn is_engine_recycle_side(side: Option<&str>) -> bool {
+    matches!(
+        side,
+        Some("bitwarden-absence") | Some("bitwarden-trash") | Some("bitwarden")
+    )
+}
+
 /// Build the sync plan.
 ///
 /// Not pure — and deliberately so (see the purity note below). `plan()`
@@ -126,6 +145,13 @@ fn top_group(group_path: &str) -> &str {
 ///   `"bitwarden-absence"` (distinguishable from a user bin, side
 ///   `"keepass"`), so a crash between vault save and journal commit
 ///   cannot turn the reappeared item's next run into a `TrashBw`;
+/// - trash-recycle reason: a trashed-arm recycle records side
+///   `"bitwarden-trash"` at apply time (legacy `"bitwarden"`), so
+///   an item the user untrashes unchanged quarantines as
+///   `trash-recycle-reappeared` instead of being re-trashed; and the
+///   tombstone arm skips only completed propagations (`"keepass"` /
+///   `"both"`), so a permanently deleted entry with a live item
+///   still propagates its delete even on an engine-recycle side;
 /// - terminal bookkeeping: both-sides-deleted pairs and already-trashed
 ///   Bitwarden items complete immediately (`record_tombstone` +
 ///   `delete_mapping_by_kp`).
@@ -356,31 +382,44 @@ pub fn plan(
                         continue;
                     }
                     if it.content_hash_hex() == last_hash {
-                        // Absence-recycle window: this entry was binned
-                        // because two listings confirmed its Bitwarden
-                        // item absent, but the item has reappeared
-                        // unchanged (vault saved, journal commit lost).
-                        // Trashing it now would delete a live item on
-                        // both sides on the strength of stale absence
-                        // evidence — quarantine for human review instead.
-                        // A genuine user bin carries no absence tombstone
+                        // Engine-recycle window: this entry was binned
+                        // by the engine — two listings confirmed its
+                        // Bitwarden item absent, or Bitwarden trashed it
+                        // — but the item has reappeared unchanged (vault
+                        // saved, journal commit lost, or the user
+                        // untrashed it). Trashing it now would delete a
+                        // live item on both sides on the strength of
+                        // stale recycle evidence — quarantine for human
+                        // review instead. A genuine user bin carries a
+                        // completed side (`"keepass"`) or no tombstone
                         // and still trashes in one run.
-                        if journal.tombstone_side(&e.uuid)?.as_deref()
-                            == Some("bitwarden-absence")
-                        {
-                            actions.push(Action::Quarantine(QuarantineCase {
-                                kind: "absence-recycle-reappeared",
-                                kp_uuid: Some(e.uuid),
-                                bw_id: Some(bw_id),
-                                title: e.title.clone(),
-                                detail: "entry was recycled after a confirmed Bitwarden listing absence, but the Bitwarden item reappeared unchanged; refusing to trash a live item on stale absence evidence".into(),
-                            }));
-                        } else {
-                            actions.push(Action::TrashBw {
-                                bw_id,
-                                kp_uuid: e.uuid,
-                                expected_revision: it.revision_date.clone(),
-                            });
+                        match journal.tombstone_side(&e.uuid)?.as_deref() {
+                            Some(side) if is_engine_recycle_side(Some(side)) => {
+                                let (kind, cause) = if side == "bitwarden-absence" {
+                                    (
+                                        "absence-recycle-reappeared",
+                                        "a confirmed Bitwarden listing absence",
+                                    )
+                                } else {
+                                    ("trash-recycle-reappeared", "its Bitwarden trash state")
+                                };
+                                actions.push(Action::Quarantine(QuarantineCase {
+                                    kind,
+                                    kp_uuid: Some(e.uuid),
+                                    bw_id: Some(bw_id),
+                                    title: e.title.clone(),
+                                    detail: format!(
+                                        "entry was recycled after {cause}, but the Bitwarden item reappeared unchanged; refusing to trash a live item on stale recycle evidence. Clear it by restoring the entry from the KeePass recycle bin, or by deleting the Bitwarden item"
+                                    ),
+                                }));
+                            }
+                            _ => {
+                                actions.push(Action::TrashBw {
+                                    bw_id,
+                                    kp_uuid: e.uuid,
+                                    expected_revision: it.revision_date.clone(),
+                                });
+                            }
                         }
                     } else {
                         actions.push(Action::Quarantine(QuarantineCase {
@@ -476,15 +515,15 @@ pub fn plan(
                         continue;
                     }
                     let it = &bw_items[bi];
-                    // Stale plan-time absence record: the entry is live
-                    // and its item is present, so the planned recycle
-                    // never landed (crash before save) — clear the record
-                    // so it stops shadowing this mapping. (A committed
-                    // recycle deletes the mapping, so this arm can only
-                    // ever see a plan-time record.)
-                    if journal.tombstone_side(&e.uuid)?.as_deref()
-                        == Some("bitwarden-absence")
-                    {
+                    // Stale engine-recycle record: the entry is live
+                    // and its item is present, so the bin decision is
+                    // moot — the planned recycle never landed (crash
+                    // before save), or the user restored the entry from
+                    // the bin. Clear the record so it stops shadowing
+                    // this mapping. (A committed recycle deletes the
+                    // mapping, so this arm can only ever see a plan-time
+                    // record or a restored-from-bin one.)
+                    if is_engine_recycle_side(journal.tombstone_side(&e.uuid)?.as_deref()) {
                         journal.clear_tombstone(&e.uuid)?;
                     }
                     let h_kp = e.content_hash_hex();
@@ -599,11 +638,21 @@ pub fn plan(
     }
 
     // KeePass tombstones with no live entry: propagate soft delete to BW.
+    // A permanently deleted entry is confirmed delete intent, so only
+    // COMPLETED propagations skip here (`"keepass"` / `"both"`). An
+    // engine-recycle side means the binning was the engine's doing, not
+    // the user's — the delete must still propagate to a live item
+    // below instead of lingering forever on a skipped tombstone.
     for u in kp_tombstones {
         if kp_by_uuid.contains_key(u) {
             continue;
         }
-        if journal.tombstoned(u)? {
+        if journal.tombstoned(u)?
+            && matches!(
+                journal.tombstone_side(u)?.as_deref(),
+                Some("keepass") | Some("both")
+            )
+        {
             continue;
         }
         if let Some((bw_id, _)) = journal.mapping_by_kp(u)? {
@@ -823,7 +872,7 @@ pub fn apply(
                         side: if *from_absence {
                             "bitwarden-absence"
                         } else {
-                            "bitwarden"
+                            "bitwarden-trash"
                         },
                     });
                     journal_ops.push(JournalOp::DeleteMappingByKp { kp_uuid: *kp_uuid });
@@ -1960,5 +2009,171 @@ mod tests {
             None,
             "a user bin must not carry an absence tombstone"
         );
+    }
+
+    #[test]
+    fn trash_recycle_reappeared_quarantines_instead_of_retrashing() {
+        // Mirror of the absence test, for the trashed arm: (1) BW
+        // trashes the item and plan recycles it; (2) apply bins the
+        // entry and the journal commit LANDS, recording side
+        // "bitwarden-trash"; (3) the user untrashes the BW item
+        // unchanged — the next run must quarantine, never TrashBw.
+        let j = test_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        // Production stamps carry the last-synced hash; the fixture's
+        // "oldhash" stamp would disagree with live content after a
+        // rebuild, so point bw-4's stamp hash at its live hash (content
+        // hashes exclude stamps, so this does not change it).
+        let live = items[3].content_hash_hex();
+        for f in items[3].fields.iter_mut() {
+            if f.name == crate::stamps::SYNC_HASH_FIELD {
+                f.value = live.clone();
+            }
+        }
+        let target_uuid: Uuid = "11111111-1111-1111-1111-111111111114".parse().unwrap();
+        let mut trashed = items.clone();
+        trashed[3].deleted_date = Some("2026-10-03T00:00:00Z".into());
+        let p = plan(
+            &kp,
+            &HashSet::new(),
+            &trashed,
+            &[],
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(
+            matches!(
+                &p.actions[0],
+                Action::RecycleKp {
+                    from_absence: false,
+                    ..
+                }
+            ),
+            "expected a trashed-arm recycle, got {:?}",
+            p.actions[0]
+        );
+        // Apply bins the entry (in-memory vault with a real recycle bin)
+        // and the journal commit lands this time.
+        let mut vault = crate::kdbx::test_vault();
+        {
+            use keepass::db::fields;
+            let mut root = vault.db.root_mut();
+            let mut e = root
+                .add_entry_with_id(keepass::db::EntryId::from_uuid(target_uuid))
+                .unwrap();
+            e.set_unprotected(fields::TITLE, "t");
+            e.set_protected(fields::USERNAME, "u");
+            e.set_protected(fields::PASSWORD, "p");
+        }
+        let bin_uuid = {
+            let mut root = vault.db.root_mut();
+            let mut bin = root.add_group();
+            bin.name = "Recycle Bin".to_string();
+            bin.id().uuid()
+        };
+        vault.db.meta.recyclebin_uuid = Some(bin_uuid);
+        let bw = BwClient::new("http://127.0.0.1:1").unwrap();
+        let (report, ops) = apply(&p, &kp, &trashed, &bw, &mut vault, &[]).unwrap();
+        assert_eq!(report.kp_recycled, 1);
+        j.apply_ops(&ops).unwrap();
+        assert_eq!(
+            j.tombstone_side(&target_uuid).unwrap().as_deref(),
+            Some("bitwarden-trash"),
+            "trashed-arm recycle must record its own side"
+        );
+        assert!(
+            j.mapping_by_kp(&target_uuid).unwrap().is_none(),
+            "committed recycle deletes the mapping"
+        );
+        // Next run: the entry is binned, the BW item untrashed unchanged.
+        let mut entries = crate::kdbx::extract_entries(&vault.db);
+        entries.extend(kp.into_iter().filter(|e| e.uuid != target_uuid));
+        let binned = entries.iter().find(|e| e.uuid == target_uuid).unwrap();
+        assert!(binned.deleted, "applied recycle must have binned the entry");
+        let p = plan(
+            &entries,
+            &HashSet::new(),
+            &items,
+            &[],
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(
+            p.actions
+                .iter()
+                .all(|a| !matches!(a, Action::TrashBw { .. })),
+            "no TrashBw may fire on an untrashed item, got {:?}",
+            p.actions
+        );
+        assert!(
+            p.actions.iter().any(
+                |a| matches!(a, Action::Quarantine(q) if q.kind == "trash-recycle-reappeared")
+            ),
+            "expected a trash-recycle-reappeared quarantine, got {:?}",
+            p.actions
+        );
+        // The new detail states its clearing path (round-3 finding 12
+        // for the absence kind, mirrored here).
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.detail.contains("recycle bin"))),
+            "detail must state the clearing path, got {:?}",
+            p.actions
+        );
+    }
+
+    #[test]
+    fn tombstone_arm_propagates_delete_for_engine_recycle_sides() {
+        // Engine-recycle tombstones are not completions: a permanently
+        // deleted KeePass entry (bin emptied) with a live Bitwarden item
+        // must still propagate its delete, for every engine side
+        // including the legacy "bitwarden" spelling.
+        for side in ["bitwarden-absence", "bitwarden-trash", "bitwarden"] {
+            let j = test_journal();
+            let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+            let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+            j.upsert_mapping(&uuid, "bw-1", &bi.content_hash_hex())
+                .unwrap();
+            j.record_tombstone(&uuid, Some("bw-1"), side).unwrap();
+            let mut tombs = HashSet::new();
+            tombs.insert(uuid);
+            let p = plan(&[], &tombs, &[bi], &[], &j, &SyncOpts::default()).unwrap();
+            assert_eq!(p.actions.len(), 1, "side {side}: got {:?}", p.actions);
+            assert!(
+                matches!(&p.actions[0], Action::TrashBw { .. }),
+                "side {side}: expected TrashBw, got {:?}",
+                p.actions[0]
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_arm_skips_completed_propagations() {
+        // Positive control for the rule above: a completed propagation
+        // ("keepass" user bin, or "both" sides deleted) still skips, even
+        // with a live Bitwarden item and a rebuilt mapping.
+        for side in ["keepass", "both"] {
+            let j = test_journal();
+            let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+            let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+            j.upsert_mapping(&uuid, "bw-1", &bi.content_hash_hex())
+                .unwrap();
+            j.record_tombstone(&uuid, Some("bw-1"), side).unwrap();
+            let mut tombs = HashSet::new();
+            tombs.insert(uuid);
+            let p = plan(&[], &tombs, &[bi], &[], &j, &SyncOpts::default()).unwrap();
+            assert!(p.actions.is_empty(), "side {side}: got {:?}", p.actions);
+        }
     }
 }

@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use crate::canonical::{hash_fields, CanonicalEntry};
 use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct BwUri {
     pub uri: Option<String>,
     /// Bitwarden URI match strategy (0=default … 6=never). Echoed back on
@@ -32,6 +32,19 @@ pub struct BwUri {
     /// it, so hashing it would permanently disagree on adopted items.
     #[serde(rename = "match", default)]
     pub match_: Option<i32>,
+}
+
+// Redacting Debug: a URI can embed credentials (`user:pass@host`), so
+// the value must never print in full — same rule as BwField's value.
+// (BwLogin's redacting Debug prints `uris`, so this is the leak path
+// for credential-bearing URIs, not just direct `{:?}` on a BwUri.)
+impl std::fmt::Debug for BwUri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwUri")
+            .field("uri", &self.uri.as_ref().map(|_| "<redacted>"))
+            .field("match_", &self.match_)
+            .finish()
+    }
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -670,9 +683,10 @@ impl BwClient {
                     // A 429 may mean the create already landed: the payload
                     // carries the KBS_SYNC_ID stamp, so a re-list that finds
                     // it is proof — return that id, never blindly re-create.
-                    // (A create that landed before its stamp call is a
-                    // different window; it surfaces later as an
-                    // unmapped-bw-item quarantine, never silent corruption.)
+                    // (Creates carry both stamps in-payload, so there is
+                    // no separate stamp call to race; a create whose
+                    // response is lost is proven landed by this re-list,
+                    // never blindly re-created.)
                     if let Ok(items) = self.list_items() {
                         if let Some(it) = items.iter().find(|i| {
                             !i.trashed()

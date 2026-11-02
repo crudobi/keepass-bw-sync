@@ -309,8 +309,8 @@ fn describe_action(a: &Action, entries: &[CanonicalEntry], items: &[BwItem]) -> 
         }
         Action::Quarantine(q) => {
             format!(
-                "Quarantine kind={} title={:?} kp={:?} bw={:?}",
-                q.kind, q.title, q.kp_uuid, q.bw_id
+                "Quarantine kind={} title={:?} kp={:?} bw={:?} detail={:?}",
+                q.kind, q.title, q.kp_uuid, q.bw_id, q.detail
             )
         }
     }
@@ -359,16 +359,41 @@ fn main() -> Result<()> {
             // vault bytes are untouched too. (The journal lock is still
             // held, and `bw.sync()` still refreshes serve's cache — a
             // download-only refresh, not a vault or journal mutation.)
+            // The guard removes the throwaway copy on ALL exits, not just
+            // the success path: a plan error returns via `?` before the
+            // explicit remove below, and a leaked copy would otherwise
+            // linger in the temp dir.
+            struct RemoveOnDrop(Option<PathBuf>);
+            impl Drop for RemoveOnDrop {
+                fn drop(&mut self) {
+                    if let Some(p) = self.0.take() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
             let tmp_journal: Option<PathBuf> = if dry_run {
                 let p = std::env::temp_dir()
                     .join(format!("kbs-dry-run-{}.db", std::process::id()));
                 if journal.exists() {
                     std::fs::copy(&journal, &p).context("copy journal for dry run")?;
+                    // The journal holds hashes and titles, not secrets —
+                    // but a 0644 copy in a shared temp dir is still wider
+                    // than the 0600 the real journal carries, so narrow it
+                    // immediately (Journal::open re-chmods on open anyway).
+                    #[cfg(unix)]
+                    std::fs::set_permissions(
+                        &p,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .context("chmod dry-run journal copy")?;
                 }
                 Some(p)
             } else {
                 None
             };
+            let _dry_run_guard = tmp_journal
+                .as_ref()
+                .map(|p| RemoveOnDrop(Some(p.clone())));
             let journal_path = tmp_journal.as_ref().unwrap_or(&journal);
             let journal = Journal::open(journal_path)?;
 
@@ -469,9 +494,30 @@ fn main() -> Result<()> {
                 .apply_ops(&journal_ops)
                 .context("commit journal ops")?;
             println!(
-                "restored stamped={} unstamped={} skipped_trashed={}",
-                report.stamped, report.unstamped, report.skipped_trashed
+                "restored stamped={} unstamped={} skipped_trashed={} skipped_org={} restored_without_blobs={}",
+                report.stamped,
+                report.unstamped,
+                report.skipped_trashed,
+                report.skipped_org,
+                report.restored_without_blobs
             );
+            if report.restored_without_blobs > 0 {
+                // Prominent, not buried: a restore that reports success
+                // while entries lack their blobs must say so loudly —
+                // the blobs survive server-side, but this vault does not
+                // have them, and the next sync will quarantine these
+                // items as `has-attachments` until blobs sync.
+                println!(
+                    "warning: {} restored entries are missing their attachment blobs (not synced); the blobs still exist in Bitwarden",
+                    report.restored_without_blobs
+                );
+            }
+            if report.skipped_org > 0 {
+                println!(
+                    "warning: {} org-owned items were skipped (never copied into a personal vault)",
+                    report.skipped_org
+                );
+            }
         }
         Cmd::Quarantine { journal, action } => {
             let j = Journal::open(&journal)?;

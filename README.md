@@ -45,7 +45,12 @@ everything ever encrypted under it. What this engine does instead:
 - The SQLite journal stores **hashes and identities only** — never secrets.
 - No plaintext is ever written to disk: `.kdbx` saves go through
   temp-file + fsync + atomic rename; `bw export --format json` is never used.
-- Sync runs are short-lived: unlock → sync → wipe. `BW_SESSION` is never
+- The shipped `bw-serve.service` runs `bw serve` permanently unlocked on
+  loopback (`Restart=always`) — the daemon form of this tool is NOT
+  short-lived unlock → sync → wipe. Its mitigations are the loopback-only
+  bind, `User=crudobi`, `NoNewPrivileges`, and `PrivateTmp`; on a
+  multi-user box, seal or socket it further (see Known limitations).
+  Manual runs are short-lived by contrast, and `BW_SESSION` is never
   persisted by this tool.
 
 Known limitations: `reqwest`/`serde_json` make their own in-RAM copies of
@@ -97,11 +102,32 @@ keepass-bw-sync sync \
   --kdbx /path/to/vault.kdbx \
   --journal /path/to/sync.db
 
-# review what the engine refused to touch:
+# preview only: prints the planned actions and exits without applying
+# anything and without mutating the journal or the vault:
+keepass-bw-sync sync --dry-run \
+  --kdbx /path/to/vault.kdbx \
+  --journal /path/to/sync.db
+
+# review what the engine refused to touch, and clear a row once you
+# have dealt with it:
 keepass-bw-sync quarantine --journal /path/to/sync.db
+keepass-bw-sync quarantine --journal /path/to/sync.db resolve <id>
 ```
 
 Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
+
+Quarantine kinds you may see: `org-item` (owned by an organization —
+never synced), `has-attachments` (carries files this engine does not
+sync), `unmapped-bw-item` (Bitwarden-only; adopt it with `sync
+--adopt`), `foreign-bw-edit` / `concurrent-edit` (Bitwarden changed
+since last sync), `delete-vs-edit`, `absence-recycle-reappeared` /
+`trash-recycle-reappeared` (an engine-recycled entry whose Bitwarden
+item came back unchanged — restore the entry from the KeePass recycle
+bin, or delete the Bitwarden item, to clear it). Adopting an item with
+`sync --adopt` resolves its `unmapped-bw-item` rows in the same journal
+transaction as the mapping, and each sync reconciles stale unmapped
+rows for already-mapped items; every other kind still needs an explicit
+`quarantine resolve`.
 
 ### Bitwarden CLI setup (one time)
 
@@ -178,6 +204,15 @@ What it restores:
 - **Unstamped items** (Bitwarden-only) too, under freshly minted UUIDs —
   a restore that dropped them would be incomplete.
 - **Trashed items are NOT restored** (`deletedDate` set in Bitwarden).
+- **Org-owned items are NOT restored** (non-empty `collectionIds`) —
+  restore never copies org credentials into a personal vault, mirroring
+  the sync gate. They are counted as `skipped_org` in the report.
+- **Items with attachments ARE restored, but without their blobs** —
+  this engine does not transfer blobs. They are counted as
+  `restored_without_blobs` and the CLI warns loudly about them, so a
+  restore never reports silent success while incomplete. The blobs
+  survive server-side; the next `sync` quarantines these items as
+  `has-attachments` until blobs sync.
 - The new journal maps uuid → Bitwarden id with the `KBS_SYNC_HASH`
   stamp as baseline when present, else the live content hash (the M1
   rule). A subsequent `sync` against the restored vault + new journal +
@@ -327,10 +362,14 @@ hardened (see checklist).
 `examples/mkvault.rs` creates an empty KDBX4 vault. It reads
 `KBS_MASTER_PASSWORD` from the environment and fails closed when unset:
 
+`mkvault` creates the vault 0600 itself. Type the password at a
+prompt rather than sourcing a password file — sourcing breaks on
+shell-significant characters:
+
 ```sh
-set -a; source "$SECRETS_DIR/vault.env"; set +a
+read -rsp "vault password: " KBS_MASTER_PASSWORD; echo
+export KBS_MASTER_PASSWORD
 cargo run --example mkvault -- "$SECRETS_DIR/vault.kdbx"
-chmod 600 "$SECRETS_DIR/vault.kdbx"
 ```
 
 ## Limitations

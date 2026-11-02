@@ -217,12 +217,16 @@ impl Journal {
     }
 
     /// The recorded tombstone side for a KeePass UUID, if any. The side
-    /// distinguishes *why* an entry was binned: `"keepass"` (user-binned),
-    /// `"bitwarden"` (Bitwarden trash propagated into KeePass), and
-    /// `"bitwarden-absence"` (recycled on a twice-confirmed Bitwarden
-    /// listing absence — see `plan`'s missing-confirmation arm). The
-    /// deleted branch consults this before trashing: an absence-recycle
-    /// whose Bitwarden item reappeared must quarantine, never trash.
+    /// distinguishes *why* an entry was binned — the full vocabulary:
+    /// `"keepass"` (user bin propagated, or tombstone-arm completion),
+    /// `"both"` (both sides deleted), `"bitwarden-absence"` (recycled
+    /// on a twice-confirmed Bitwarden listing absence), and
+    /// `"bitwarden-trash"` (recycled after Bitwarden trashed the item;
+    /// legacy spelling `"bitwarden"`). Only `"keepass"` / `"both"`
+    /// are completed propagations. The engine-recycle sides are NOT:
+    /// the deleted branch quarantines a reappeared item on those sides
+    /// instead of trashing it, and the tombstone arm still propagates
+    /// the delete for a permanently deleted entry on those sides.
     pub fn tombstone_side(&self, kp_uuid: &Uuid) -> Result<Option<String>> {
         let mut st = self
             .conn
@@ -235,10 +239,11 @@ impl Journal {
         }
     }
 
-    /// Delete a tombstone row. Used only to clear a stale plan-time
-    /// `"bitwarden-absence"` record: when the entry is live and its
-    /// Bitwarden item is present again, the recycle never landed and the
-    /// record is stale evidence, not a completed delete.
+    /// Delete a tombstone row. Used only to clear a stale engine-recycle
+    /// record: when the entry is live and its Bitwarden item is present
+    /// again, the bin decision is moot (the recycle never landed, or the
+    /// user restored the entry from the bin) and the record is stale
+    /// evidence, not a completed delete.
     pub fn clear_tombstone(&self, kp_uuid: &Uuid) -> Result<()> {
         self.conn.execute(
             "DELETE FROM tombstone WHERE kp_uuid = ?1",

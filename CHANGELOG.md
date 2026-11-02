@@ -2,12 +2,54 @@
 
 ## Unreleased
 
+- **Restore now honors the sync gates, and delete propagation no longer
+  undoes a user's restore.** `restore` skips org-owned items (counted
+  as `skipped_org`) and counts entries restored without their blobs
+  (`restored_without_blobs`, warned loudly on the CLI) instead of
+  reporting silent success while incomplete. Trashed-arm recycles now
+  record side `bitwarden-trash`, so an item the user untrashes
+  unchanged quarantines as `trash-recycle-reappeared` instead of being
+  re-trashed; the tombstone arm skips only completed propagations
+  (`keepass`/`both`), so a permanently deleted entry with a live item
+  still propagates its delete. `Quarantine` dry-run lines now include
+  the reason inline. `BwUri` Debug redacts credential-bearing URIs, the
+  dry-run journal copy is 0600 and removed on all exits, and the README
+  documents `--dry-run`, `--adopt` auto-resolve, the quarantine kinds,
+  and `quarantine resolve` (plus restore-gate bullets and an honest
+  threat model for the shipped daemon).
+
 - **Adopting a quarantined item now clears its quarantine row.**
   `sync --adopt` resolves the item's `unmapped-bw-item` rows in the
   same journal transaction as the mapping, and each sync reconciles
   stale unmapped rows for already-mapped items -- so an adopted item
   can no longer stay `quarantine_pending` forever. Other quarantine
   kinds still need an explicit `quarantine resolve`.
+
+- **Dry-run mode, org/attachment quarantine, body cap, and crash-path
+  tests.** `sync --dry-run` plans against a throwaway journal copy and
+  exits before apply or any vault save (journal and vault bytes
+  bit-identical in test). Items with non-empty `collectionIds` quarantine
+  as `org-item` and items with attachments as `has-attachments` before
+  any other action, under default, `--writeback`, and `--force` alike,
+  so full-replace PUTs can never strip org membership. Response bodies
+  are capped at 32 MiB inside the JSON-envelope path (a future streaming
+  attachment download bypasses it by design). The RecycleKp re-verify
+  residual closed via the durable `bitwarden-absence` tombstone side,
+  and crash-path integration tests cover post-save journal-commit loss
+  and flock contention. The `plan()` purity refactor stopped with cause
+  documented; its docstring now inventories every plan-time write.
+
+- **Restore refreshes the Bitwarden cache, missing-arm edit check, and
+  proxy hardening.** The restore arm calls `bw.sync()` (a download-only
+  POST, so the no-server-writes guarantee survives) before listing, so a
+  stale cache can no longer silently under-restore. The
+  missing-confirmation arm mirrors the trashed arm: a KeePass edit since
+  the watermark turns a confirmed absence into a `delete-vs-edit`
+  quarantine instead of a recycle. The client sets `.no_proxy()` (proxy
+  env vars can no longer route loopback plaintext through a proxy),
+  the `mkvault` doc comment no longer shows the stale `--offline` form,
+  and the README `bw` walkthrough covers install paths, `--apikey`
+  with `BW_CLIENTID`/`BW_CLIENTSECRET`, interactive 2FA, and `--raw`.
 
 - **Writeback no longer destroys KeePassXC TOTP.** `apply_bw_to_entry`
   retains all TOTP-source fields (`totp`, `otp`, `TOTP Seed`,
@@ -36,7 +78,9 @@
 ## 0.1.0 — 2026-11-01 (unreleased on crates.io; private repo)
 
 - `restore` subcommand: rebuild a KeePass vault from Bitwarden, read
-  only — it never writes to Bitwarden (GETs only, enforced structurally).
+  only — it never writes to the Bitwarden server vault (enforced
+  structurally: the refresh is a download-only POST /sync, then only
+  GET list calls).
   Stamped items keep their stamp UUIDs; unstamped items are adopted
   under fresh UUIDs without stamping back; trashed items skipped.
 - 429 retry with create-safety: direct and wrapped-400 rate limits

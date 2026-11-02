@@ -24,6 +24,15 @@
 //!   rather than matching them. Stamped items do not have this problem:
 //!   their identity survives in the Bitwarden stamp itself.
 //! - Trashed Bitwarden items (`deletedDate` set) are NOT restored.
+//! - Org-owned items (non-empty `collectionIds`) are NOT restored either:
+//!   copying org credentials into a personal vault would evade org
+//!   control, so they are skipped and counted in `skipped_org`, mirroring
+//!   the sync gate.
+//! - Items with attachments ARE restored, but without their blobs (this
+//!   engine does not transfer blobs) and counted in
+//!   `restored_without_blobs`, so a restore never reports silent success
+//!   while incomplete. The blobs survive server-side; the next `sync`
+//!   quarantines these items as `has-attachments` until blobs sync.
 //! - Journal baseline follows the M1 rule: the `KBS_SYNC_HASH` stamp
 //!   when present, else the item's live content hash. A restored vault
 //!   plus its new journal plus the same Bitwarden state therefore plans
@@ -66,6 +75,14 @@ pub struct RestoreReport {
     pub unstamped: usize,
     /// Bitwarden items skipped because they are in the trash.
     pub skipped_trashed: usize,
+    /// Bitwarden items skipped because they are owned by an organization
+    /// (non-empty `collectionIds`): restore never copies org items into
+    /// a personal vault, mirroring the sync gate.
+    pub skipped_org: usize,
+    /// Items restored without their attachment blobs: the entry itself
+    /// is restored, but this engine does not transfer blobs, so the
+    /// restore is incomplete for these items by exactly that much.
+    pub restored_without_blobs: usize,
 }
 
 /// Fail closed when a restore target already holds entries: restoring
@@ -120,6 +137,12 @@ pub fn restore_into(
                 it.id
             );
         }
+        // Org gate, mirroring sync: never copy org credentials into a
+        // personal vault. Skipped, counted, no entry, no mapping.
+        if it.org_owned() {
+            report.skipped_org += 1;
+            continue;
+        }
         let folder_name = it
             .folder_id
             .as_deref()
@@ -164,6 +187,11 @@ pub fn restore_into(
         } else {
             report.unstamped += 1;
         }
+        // Attachments ride no transfer: the entry is restored, but its
+        // blobs are not, and the report must say so (see module docs).
+        if it.has_attachments() {
+            report.restored_without_blobs += 1;
+        }
         journal_ops.push(JournalOp::UpsertMapping {
             kp_uuid: uuid,
             bw_id: it.id.clone(),
@@ -176,7 +204,7 @@ pub fn restore_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bw::{BwField, BwLogin, BwUri};
+    use crate::bw::{BwAttachment, BwField, BwLogin, BwUri};
     use crate::journal::test_journal;
     use crate::kdbx::test_vault;
     use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
@@ -250,7 +278,9 @@ mod tests {
             RestoreReport {
                 stamped: 1,
                 unstamped: 0,
-                skipped_trashed: 0
+                skipped_trashed: 0,
+                skipped_org: 0,
+                restored_without_blobs: 0
             }
         );
         let entries = extract_entries(&vault.db);
@@ -442,5 +472,38 @@ mod tests {
             p.actions.len()
         );
         assert_eq!(journal.unresolved_quarantine_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn org_items_are_skipped_and_counted_never_adopted() {
+        let mut vault = test_vault();
+        let mut org = bw_item("bw-org", "org-owned", None, false);
+        org.collection_ids = vec!["coll-1".into()];
+        let items = vec![org, bw_item("bw-1", "plain", None, false)];
+        let (report, ops) = restore_into(&mut vault.db, &items, &folders()).unwrap();
+        assert_eq!(report.skipped_org, 1);
+        assert_eq!(report.unstamped, 1);
+        assert_eq!(ops.len(), 1);
+        let entries = extract_entries(&vault.db);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "plain");
+    }
+
+    #[test]
+    fn attached_items_restore_without_blobs_and_are_counted() {
+        let mut vault = test_vault();
+        let mut att = bw_item("bw-att", "with-blob", None, false);
+        att.attachments = vec![BwAttachment {
+            id: Some("att-1".into()),
+            file_name: Some("scan.pdf".into()),
+            size: Some(1234),
+        }];
+        let items = vec![att];
+        let (report, ops) = restore_into(&mut vault.db, &items, &folders()).unwrap();
+        assert_eq!(report.restored_without_blobs, 1);
+        assert_eq!(report.unstamped, 1);
+        assert_eq!(ops.len(), 1);
+        // The entry itself restores; only its blobs are missing.
+        assert_eq!(extract_entries(&vault.db).len(), 1);
     }
 }
