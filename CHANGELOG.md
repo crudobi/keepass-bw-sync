@@ -164,3 +164,24 @@
 - Restore warnings now name the skipped-org and blob-less items.
 - README kinds list completed; zeroization and daemon
   threat-model docs corrected to what the code actually does.
+
+## Remaining round-4 items (2026-11-02)
+
+- `save_vault` now tightens to 0600; dry-run journal copy is
+  O_EXCL with a random suffix.
+- Sync list calls carry the daemon hint; quarantine help
+  documents the bare list invocation; `sync`/`restore --journal`
+  default to `sync.db` next to the vault.
+- `put` prompts for the master password before taking the lock.
+- `--adopt` now self-heals the stamp-before-save orphan (no
+  mapping, no tombstone, type-1 logins only).
+- Loopback check resolves and requires all-loopback addresses;
+  rate-limit detection keys on HTTP 429 (or a 400 embedding the
+  upstream 429 marker).
+- Daemon peer boundary (system change, not repo code): ufw
+  before.rules now ACCEPTs loopback TCP to port 8087 only for
+  uid 0 and uid 1001 (crudobi) and DROPs all other local UIDs,
+  in v4 and v6. Verified live: nobody-user probe times out,
+  crudobi/root reach the daemon, production sync unaffected.
+  Rollback: restore /etc/ufw/before.rules(.bak-kbs-guard-20261102)
+  and before6.rules, then ufw reload.
