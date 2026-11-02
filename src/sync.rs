@@ -129,6 +129,10 @@ fn top_group(group_path: &str) -> &str {
 /// - terminal bookkeeping: both-sides-deleted pairs and already-trashed
 ///   Bitwarden items complete immediately (`record_tombstone` +
 ///   `delete_mapping_by_kp`).
+/// - quarantine reconciliation: open `unmapped-bw-item` rows for
+///   live-mapped items are resolved (their premise is false once the
+///   item is mapped). The only quarantine-table write plan makes, and
+///   it only ever resolves -- plan never *creates* rows.
 ///
 /// Purity note (2026-11-01 review, refactor deliberately NOT taken): a
 /// pure move — plan returns its journal writes as a delta for the caller
@@ -151,7 +155,8 @@ fn top_group(group_path: &str) -> &str {
 /// [`Journal::apply_ops`] only after the KeePass database is durably
 /// saved, so the journal can never claim KeePass mutations that never
 /// reached disk. Quarantine rows are per-action too: `plan()` only
-/// returns `Quarantine` actions, it never writes quarantine rows itself.
+/// returns `Quarantine` actions, it never creates quarantine rows itself
+/// (the reconciliation above only resolves stale unmapped rows).
 pub fn plan(
     kp_entries: &[CanonicalEntry],
     kp_tombstones: &HashSet<Uuid>,
@@ -207,6 +212,15 @@ pub fn plan(
             );
         }
     }
+
+    // Reconcile stale unmapped rows: an open `unmapped-bw-item` row whose
+    // item is now live-mapped states something false, so resolve it.
+    // After the listing guard on purpose: a refused sync makes no changes.
+    // Scoped to that kind only -- every other kind still needs human
+    // review even when the item is mapped. This is plan-time bookkeeping
+    // like `clear_missing` below, and it only ever resolves: plan never
+    // *creates* quarantine rows (those stay per-action, via `apply`).
+    journal.reconcile_unmapped_rows()?;
 
     // Clear stale missing records for items present in this listing: a
     // reappearance means the earlier absence was a glitch, not a delete,
@@ -836,6 +850,14 @@ pub fn apply(
                     bw_id: it.id.clone(),
                     hash,
                 });
+                // Adopting is the confirmation: resolve the item's open
+                // unmapped rows in the same journal transaction as the
+                // mapping, so a confirmed item can never stay pending.
+                // (Deferred like every other op: if the vault save fails,
+                // neither the mapping nor the resolution commits.)
+                journal_ops.push(JournalOp::ResolveUnmappedForBw {
+                    bw_id: it.id.clone(),
+                });
                 report.kp_adopted += 1;
             }
             Action::WritebackEdit { bw_id, kp_uuid, item_idx } => {
@@ -940,6 +962,32 @@ mod tests {
         j.upsert_mapping(&kp[0].uuid, "bw-1", &bi.content_hash_hex()).unwrap();
         let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
         assert!(p.actions.is_empty(), "expected no actions, got {:?}", p.actions.len());
+    }
+
+    #[test]
+    fn plan_reconciles_stale_unmapped_row_for_mapped_pair() {
+        // TapPlastics shape: the item was quarantined as unmapped in one
+        // run and adopted in a later one; the next sync must resolve the
+        // stale row with no other action for the item.
+        let j = test_journal();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let h = kp[0].content_hash_hex();
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &h).unwrap();
+        let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        // make the BW content hash match: stamp hash must equal live hash
+        bi.fields.iter_mut().find(|f| f.name == crate::stamps::SYNC_HASH_FIELD).unwrap().value = bi.content_hash_hex();
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &bi.content_hash_hex()).unwrap();
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        // Other kind for the same mapped pair -> stays open.
+        j.quarantine("foreign-bw-edit", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 2);
+        let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "expected no actions, got {:?}", p.actions);
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "foreign-bw-edit");
     }
 
     #[test]
@@ -1575,6 +1623,62 @@ mod tests {
         let entries = crate::kdbx::extract_entries(&vault.db);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].group_path, "Ops");
+    }
+
+    #[test]
+    fn apply_adopt_resolves_unmapped_quarantine_row() {
+        // Adopting is the confirmation: the adopt op must resolve the
+        // item's open unmapped row in the same journal transaction as
+        // the mapping (same stub/item shape as the folder test above,
+        // minus the folder).
+        let item = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": "bw-1", "name": "adopted", "notes": null, "favorite": false,
+                "folderId": null, "type": 1, "reprompt": 0,
+                "login": {"username": "u", "password": "p", "totp": null,
+                          "uris": [{"uri": "https://x.example.com", "match": null}]},
+                "fields": [],
+                "revisionDate": "r1", "deletedDate": null
+            }
+        })
+        .to_string();
+        let base = crate::bw::tests::stub_server(vec![
+            ("GET /object/item/bw-1 ".into(), 200, item),
+            (
+                "PUT /object/item/bw-1 ".into(),
+                200,
+                r#"{"success":true}"#.into(),
+            ),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let mut bi = bw_item("bw-1", None, "r1");
+        bi.name = "adopted".into();
+        bi.login = Some(crate::bw::BwLogin {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            totp: None,
+            uris: Some(vec![crate::bw::BwUri {
+                uri: Some("https://x.example.com".into()),
+                match_: None,
+            }]),
+        });
+        let p = Plan {
+            actions: vec![Action::AdoptBwNew { item_idx: 0 }],
+        };
+        let mut vault = crate::kdbx::test_vault();
+        let j = test_journal();
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "adopted", "d")
+            .unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 1);
+        let (report, ops) = apply(&p, &[], &[bi], &bw, &mut vault, &[]).unwrap();
+        assert_eq!(report.kp_adopted, 1);
+        assert!(ops.iter().any(|op| matches!(op,
+            crate::journal::JournalOp::ResolveUnmappedForBw { bw_id }
+            if bw_id == "bw-1")));
+        j.apply_ops(&ops).unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
+        assert!(j.mapping_by_bw("bw-1").unwrap().is_some());
     }
 
     fn org_item(id: &str, kp_uuid: Option<&str>, rev: &str) -> BwItem {

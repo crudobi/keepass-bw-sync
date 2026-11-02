@@ -31,6 +31,12 @@ pub enum JournalOp {
     DeleteMappingByKp {
         kp_uuid: Uuid,
     },
+    /// Resolve open `unmapped-bw-item` rows for one Bitwarden item
+    /// (adopt confirmation, or reconciliation of a stale row). Kind-scoped
+    /// on purpose: other kinds still need human review.
+    ResolveUnmappedForBw {
+        bw_id: String,
+    },
     Quarantine {
         kind: &'static str,
         kp_uuid: Option<Uuid>,
@@ -342,6 +348,38 @@ impl Journal {
         Ok(n > 0)
     }
 
+    /// Resolve open `unmapped-bw-item` rows for one Bitwarden item.
+    /// Scoped to that kind on purpose: an unmapped item has no pair, so
+    /// its open rows can only be unmapped-item rows in practice -- but
+    /// if a row of another kind ever pointed at the same id, resolving
+    /// it here would hide a real conflict, so the kind filter stays.
+    /// Returns rows resolved.
+    pub fn resolve_unmapped_for_bw(&self, bw_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE quarantine SET resolved = 1 WHERE resolved = 0
+             AND kind = 'unmapped-bw-item' AND bw_id = ?1",
+            params![bw_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Reconcile stale unmapped rows: an open `unmapped-bw-item` row whose
+    /// item is now live-mapped (adopted, or mapped by any other path)
+    /// states something false, so resolve it. Scoped narrowly to that
+    /// kind plus live mappings (tombstoned pairs excluded, mirroring
+    /// `live_mapped_bw_ids`): every other kind still needs human review
+    /// even when the item is mapped. Returns rows resolved.
+    pub fn reconcile_unmapped_rows(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE quarantine SET resolved = 1 WHERE resolved = 0
+             AND kind = 'unmapped-bw-item' AND bw_id IN
+             (SELECT bw_id FROM mapping m WHERE NOT EXISTS
+              (SELECT 1 FROM tombstone t WHERE t.kp_uuid = m.kp_uuid))",
+            [],
+        )?;
+        Ok(n)
+    }
+
     pub fn list_quarantine(&self) -> Result<Vec<QuarantineRow>> {
         let mut st = self.conn.prepare(
             "SELECT id, kind, kp_uuid, bw_id, title, detail FROM quarantine
@@ -363,10 +401,12 @@ impl Journal {
     /// Total unresolved quarantine rows: the authoritative "pending review"
     /// count. This is what the `quarantine` subcommand lists and what an
     /// operator compares against -- unlike the per-run sync summary's
-    /// `quarantined` field, which counts only actions taken *this run* and
-    /// therefore disagrees with the table whenever an older row is still
-    /// open (e.g. an item quarantined in one run and adopted in a later
-    /// one without resolving its row).
+    /// `quarantined` field, which counts only actions taken *this run*.
+    /// An adopted item no longer leaves its row open: adopting resolves
+    /// the item's `unmapped-bw-item` rows atomically with the mapping
+    /// commit, and each sync reconciles stale unmapped rows for mapped
+    /// items. Every other kind still needs an explicit `quarantine
+    /// resolve`.
     pub fn unresolved_quarantine_count(&self) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM quarantine WHERE resolved = 0",
@@ -398,6 +438,9 @@ impl Journal {
                 }
                 JournalOp::DeleteMappingByKp { kp_uuid } => {
                     self.delete_mapping_by_kp(kp_uuid)
+                }
+                JournalOp::ResolveUnmappedForBw { bw_id } => {
+                    self.resolve_unmapped_for_bw(bw_id).map(|_| ())
                 }
                 JournalOp::Quarantine { kind, kp_uuid, bw_id, title, detail } => {
                     self.quarantine(kind, kp_uuid.as_ref(), bw_id.as_deref(), title, detail)
@@ -461,6 +504,47 @@ mod tests {
         j.quarantine("concurrent-edit", Some(&u), Some("bw-1"), "t", "d")
             .unwrap();
         assert_eq!(j.list_quarantine().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn resolve_unmapped_for_bw_is_kind_scoped() {
+        let j = test_journal();
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        j.quarantine("foreign-bw-edit", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        assert_eq!(j.resolve_unmapped_for_bw("bw-1").unwrap(), 1);
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "foreign-bw-edit");
+    }
+
+    #[test]
+    fn reconcile_unmapped_rows_only_mapped_unmapped_kind() {
+        let j = test_journal();
+        let u = test_uuid();
+        j.upsert_mapping(&u, "bw-1", "h").unwrap();
+        // Stale: unmapped row for a now-mapped item -> resolved.
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        // Other kind for the same mapped item -> stays open.
+        j.quarantine("foreign-bw-edit", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        // Unmapped row for a still-unmapped item -> stays open.
+        j.quarantine("unmapped-bw-item", None, Some("bw-2"), "t", "d")
+            .unwrap();
+        // Tombstoned mapping does not count as mapped -> stays open.
+        let u2 = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        j.upsert_mapping(&u2, "bw-3", "h").unwrap();
+        j.record_tombstone(&u2, Some("bw-3"), "keepass").unwrap();
+        j.quarantine("unmapped-bw-item", None, Some("bw-3"), "t", "d")
+            .unwrap();
+        assert_eq!(j.reconcile_unmapped_rows().unwrap(), 1);
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.1 == "foreign-bw-edit"));
+        assert!(rows.iter().any(|r| r.3.as_deref() == Some("bw-2")));
+        assert!(rows.iter().any(|r| r.3.as_deref() == Some("bw-3")));
     }
 
     #[test]

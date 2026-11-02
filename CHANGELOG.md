@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Adopting a quarantined item now clears its quarantine row.**
+  `sync --adopt` resolves the item's `unmapped-bw-item` rows in the
+  same journal transaction as the mapping, and each sync reconciles
+  stale unmapped rows for already-mapped items -- so an adopted item
+  can no longer stay `quarantine_pending` forever. Other quarantine
+  kinds still need an explicit `quarantine resolve`.
+
 - **Writeback no longer destroys KeePassXC TOTP.** `apply_bw_to_entry`
   retains all TOTP-source fields (`totp`, `otp`, `TOTP Seed`,
   `TOTP Settings`) when the Bitwarden item carries no TOTP; previously
