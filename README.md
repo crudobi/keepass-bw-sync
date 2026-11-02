@@ -112,6 +112,9 @@ keepass-bw-sync sync \
   --kdbx /path/to/vault.kdbx \
   --journal /path/to/sync.db
 
+`--journal` defaults to `sync.db` next to the vault when omitted (same
+default as `put`; `restore`'s new journal defaults the same way).
+
 # preview only: prints the planned actions and exits without applying
 # anything and without mutating the journal or the vault:
 keepass-bw-sync sync --dry-run \
@@ -125,7 +128,7 @@ keepass-bw-sync quarantine --journal /path/to/sync.db resolve <id>
 keepass-bw-sync quarantine --journal /path/to/sync.db acknowledge <id>
 ```
 
-Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
+Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt (except `restore`, which takes its password from `KBS_MASTER_PASSWORD` only — see `restore` below).
 
 Quarantine kinds you may see: `org-item` (owned by an organization —
 never synced), `has-attachments` (carries files this engine does not

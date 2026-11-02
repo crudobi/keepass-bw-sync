@@ -30,7 +30,9 @@ use uuid::Uuid;
 use crate::bw::{BwClient, BwFolder, BwItem, EditOutcome, TrashOutcome};
 use crate::canonical::CanonicalEntry;
 use crate::journal::{Journal, JournalOp};
-use crate::kdbx::{adopt_bw_entry, recycle_entry, writeback_entry, KdbxVault};
+use crate::kdbx::{
+    adopt_bw_entry, adopt_bw_entry_with_uuid, recycle_entry, writeback_entry, KdbxVault,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncOpts {
@@ -64,6 +66,12 @@ pub enum Action {
     /// Unmapped, unstamped Bitwarden item: adopt as a new KeePass entry
     /// (only with --adopt), then stamp KBS_SYNC_ID back onto the BW item.
     AdoptBwNew { item_idx: usize },
+    /// Stamped Bitwarden item whose KeePass entry does not exist
+    /// (interrupted adopt: the stamp PUT landed but the vault save did
+    /// not): re-adopt under the STAMP's UUID (only with --adopt), then
+    /// re-stamp the fresh hash. Never fires when the stamp UUID has a
+    /// tombstone — that path rebuilds the mapping instead.
+    AdoptBwStamped { item_idx: usize, uuid: Uuid },
     /// Foreign BW edit applied into KeePass (only with --writeback).
     WritebackEdit { bw_id: String, kp_uuid: Uuid, item_idx: usize },
     /// Genuine conflict or unmappable item: queue for human review.
@@ -437,7 +445,7 @@ pub fn plan(
     // mismatch as what it is: a foreign edit (quarantine by default;
     // --writeback/--force still apply). Items stamped before KBS_SYNC_HASH
     // existed have no stamp hash; only those fall back to the live hash.
-    for it in bw_items {
+    for (idx, it) in bw_items.iter().enumerate() {
         if blocked_bw.contains(it.id.as_str()) {
             continue;
         }
@@ -453,6 +461,22 @@ pub fn plan(
                         .filter(|x| !x.is_empty())
                         .unwrap_or_else(|| it.content_hash_hex());
                     journal.upsert_mapping(&u, &it.id, &baseline)?;
+                } else if opts.adopt && it.item_type == 1 {
+                    // Interrupted-adopt auto-recovery, narrowly scoped:
+                    // this branch already guarantees no mapping, no live
+                    // KeePass entry, no KeePass tombstone, and no journal
+                    // tombstone for the stamp UUID (all of those set
+                    // kp_has above) — the only way here is a stamp PUT
+                    // whose vault save never landed. Re-adopt under the
+                    // stamp UUID (a fresh UUID would abandon the stamp);
+                    // the apply arm re-stamps the fresh hash and resolves
+                    // the orphan row in the same transaction as the
+                    // mapping. Non-login items keep the quarantine: the
+                    // adopt loop never reshapes them either.
+                    actions.push(Action::AdoptBwStamped {
+                        item_idx: idx,
+                        uuid: u,
+                    });
                 } else {
                     actions.push(Action::Quarantine(QuarantineCase {
                         kind: "orphan_bw_stamp",
@@ -1122,6 +1146,37 @@ pub fn apply(
                 });
                 report.kp_adopted += 1;
             }
+            Action::AdoptBwStamped { item_idx, uuid } => {
+                let it = &bw_items[*item_idx];
+                // Placement: the KeePass entry lands in the group named
+                // by the item's Bitwarden folder (flat model), same as
+                // AdoptBwNew.
+                let folder_name = it
+                    .folder_id
+                    .as_deref()
+                    .and_then(|id| folders.iter().find(|f| f.id == id))
+                    .map(|f| f.name.as_str());
+                // Pinned to the stamp UUID: the stamp already names this
+                // entry, and a fresh UUID would orphan it again.
+                let uuid = adopt_bw_entry_with_uuid(&mut vault.db, it, folder_name, Some(*uuid))?;
+                let hash = it.content_hash_hex();
+                // Re-stamp the fresh hash: the interrupted stamp may be
+                // stale if the item was edited since the crash.
+                bw.stamp_item(&it.id, &uuid, &hash)
+                    .with_context(|| format!("stamp re-adopted item {}", it.id))?;
+                journal_ops.push(JournalOp::UpsertMapping {
+                    kp_uuid: uuid,
+                    bw_id: it.id.clone(),
+                    hash,
+                });
+                // The interrupted adopt's orphan row resolves in the same
+                // transaction as the mapping, like adopt's unmapped
+                // resolution — otherwise it would nag forever.
+                journal_ops.push(JournalOp::ResolveOrphanForBw {
+                    bw_id: it.id.clone(),
+                });
+                report.kp_adopted += 1;
+            }
             Action::WritebackEdit { bw_id, kp_uuid, item_idx } => {
                 let it = &bw_items[*item_idx];
                 if writeback_entry(&mut vault.db, *kp_uuid, it) {
@@ -1656,6 +1711,86 @@ mod tests {
     }
 
     #[test]
+    fn orphan_bw_stamp_readopts_under_adopt_only() {
+        // Interrupted adopt, --adopt given: the stamped item re-adopts
+        // under its STAMP's UUID instead of quarantining again.
+        let j = test_journal();
+        let orphan = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        let opts = SyncOpts {
+            adopt: true,
+            ..Default::default()
+        };
+        let p = plan(&[], &HashSet::new(), &[orphan], &[], &j, &opts).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(matches!(&p.actions[0],
+            Action::AdoptBwStamped { item_idx: 0, uuid }
+            if uuid.to_string() == "22222222-2222-2222-2222-222222222222"));
+        // Same item without --adopt still quarantines: the gate is the
+        // flag, not the item shape.
+        let j2 = test_journal();
+        let orphan2 = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        let p2 = plan(
+            &[],
+            &HashSet::new(),
+            &[orphan2],
+            &[],
+            &j2,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(p2.actions.len(), 1);
+        assert!(matches!(&p2.actions[0], Action::Quarantine(q) if q.kind == "orphan_bw_stamp"));
+    }
+
+    #[test]
+    fn orphan_bw_stamp_with_tombstone_rebuilds_not_readopts() {
+        // A stamped UUID with a journal tombstone is a deleted entry,
+        // never an interrupted adopt: even under --adopt it must rebuild
+        // the mapping (and then follow the tombstone path), never
+        // resurrect the entry.
+        let j = test_journal();
+        let u = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        j.record_tombstone(&u, Some("bw-9"), "keepass").unwrap();
+        let orphan = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        let opts = SyncOpts {
+            adopt: true,
+            ..Default::default()
+        };
+        let p = plan(&[], &HashSet::new(), &[orphan], &[], &j, &opts).unwrap();
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| matches!(a, Action::AdoptBwStamped { .. })),
+            "tombstoned stamp must never re-adopt, got {:?}",
+            p.actions
+        );
+        assert_eq!(
+            j.mapping_by_kp(&u)
+                .unwrap()
+                .map(|(id, _hash)| id)
+                .as_deref(),
+            Some("bw-9"),
+            "tombstoned stamp rebuilds its mapping"
+        );
+    }
+
+    #[test]
+    fn orphan_bw_stamp_non_login_still_quarantines_under_adopt() {
+        // A stamped secure note must never be reshaped into a login:
+        // even under --adopt it keeps the orphan quarantine.
+        let j = test_journal();
+        let mut note = bw_item("bw-9", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        note.item_type = 2; // secure note
+        let opts = SyncOpts {
+            adopt: true,
+            ..Default::default()
+        };
+        let p = plan(&[], &HashSet::new(), &[note], &[], &j, &opts).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "orphan_bw_stamp"));
+    }
+
+    #[test]
     fn stamped_item_with_kp_entry_rebuilds_mapping() {
         // Positive control for the orphan gate: when the stamped UUID matches
         // a real KeePass entry, the mapping is rebuilt and the in-sync pair
@@ -2052,6 +2187,79 @@ mod tests {
         j.apply_ops(&ops).unwrap();
         assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
         assert!(j.mapping_by_bw("bw-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_adopt_stamped_resolves_orphan_row_and_pins_uuid() {
+        // Interrupted adopt: the item is stamped with UUID u but no
+        // KeePass entry exists. The re-adopt must create the entry
+        // under u (not a fresh UUID), re-stamp the fresh hash, and
+        // resolve the orphan row in the same transaction as the mapping.
+        let item = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": "bw-1", "name": "adopted", "notes": null, "favorite": false,
+                "folderId": null, "type": 1, "reprompt": 0,
+                "login": {"username": "u", "password": "p", "totp": null,
+                          "uris": [{"uri": "https://x.example.com", "match": null}]},
+                "fields": [],
+                "revisionDate": "r1", "deletedDate": null
+            }
+        })
+        .to_string();
+        let base = crate::bw::tests::stub_server(vec![
+            ("GET /object/item/bw-1 ".into(), 200, item),
+            (
+                "PUT /object/item/bw-1 ".into(),
+                200,
+                r#"{"success":true}"#.into(),
+            ),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        let mut bi = bw_item("bw-1", Some("22222222-2222-2222-2222-222222222222"), "r1");
+        bi.name = "adopted".into();
+        bi.login = Some(crate::bw::BwLogin {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            totp: None,
+            uris: Some(vec![crate::bw::BwUri {
+                uri: Some("https://x.example.com".into()),
+                match_: None,
+            }]),
+        });
+        let u = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let p = Plan {
+            actions: vec![Action::AdoptBwStamped {
+                item_idx: 0,
+                uuid: u,
+            }],
+        };
+        let mut vault = crate::kdbx::test_vault();
+        let j = test_journal();
+        j.quarantine("orphan_bw_stamp", Some(&u), Some("bw-1"), "adopted", "d")
+            .unwrap();
+        // A row of another kind for the same item must survive: the
+        // orphan resolution is kind-scoped.
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "adopted", "d")
+            .unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 2);
+        let (report, ops) = apply(&p, &[], &[bi], &bw, &mut vault, &[]).unwrap();
+        assert_eq!(report.kp_adopted, 1);
+        assert!(ops.iter().any(|op| matches!(op,
+            crate::journal::JournalOp::ResolveOrphanForBw { bw_id }
+            if bw_id == "bw-1")));
+        j.apply_ops(&ops).unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 1);
+        assert_eq!(
+            j.mapping_by_kp(&u)
+                .unwrap()
+                .map(|(id, _hash)| id)
+                .as_deref(),
+            Some("bw-1")
+        );
+        let entries = crate::kdbx::extract_entries(&vault.db);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, u);
     }
 
     fn org_item(id: &str, kp_uuid: Option<&str>, rev: &str) -> BwItem {

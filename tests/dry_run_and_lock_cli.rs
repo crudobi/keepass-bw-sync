@@ -401,3 +401,297 @@ fn quarantine_acknowledge_cli() {
         "resolve output must state the re-queue rule: {stdout}"
     );
 }
+
+#[test]
+fn dry_run_copy_ignores_planted_symlink_at_predictable_name() {
+    // The old construction used the predictable name
+    // kbs-dry-run-{pid}.db with truncate + symlink-following: a planted
+    // link there would receive journal bytes. The new construction uses
+    // O_EXCL under a random suffix, so the planted link must be untouched
+    // and the copy must land elsewhere, byte-identical and 0600.
+    use std::os::unix::fs::symlink;
+    let dir = tmpdir("dryrun-copy");
+    let journal_path = dir.join("sync.db");
+    drop(keepass_bw_sync::journal::Journal::open(&journal_path).unwrap());
+    let scratch = dir.join("tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let canary = dir.join("canary");
+    std::fs::write(&canary, b"canary").unwrap();
+    let predictable = scratch.join(format!("kbs-dry-run-{}.db", std::process::id()));
+    symlink(&canary, &predictable).unwrap();
+    let p = keepass_bw_sync::journal::create_dry_run_copy(&journal_path, &scratch).unwrap();
+    assert_ne!(p, predictable, "copy must not use the predictable name");
+    assert_eq!(
+        std::fs::read(&canary).unwrap(),
+        b"canary",
+        "planted link target must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        std::fs::read(&journal_path).unwrap(),
+        "copy must hold the journal bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "copy must be 0600"
+        );
+    }
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stub whose /sync succeeds but whose item listing fails: proves the
+/// sync arm's list calls carry the same daemon hint as restore's.
+fn spawn_failing_list_stub() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+                continue;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                let t = line.trim();
+                if t.is_empty() {
+                    break;
+                }
+                if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+            }
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let (method, path) = (parts[0], parts[1]);
+            let (status, resp_body) = match (method, path) {
+                ("POST", "/sync") => (200, serde_json::json!({"success": true, "data": {}})),
+                ("GET", "/list/object/items") => (
+                    500,
+                    serde_json::json!({"success": false, "message": "boom"}),
+                ),
+                _ => (200, serde_json::json!({"success": false})),
+            };
+            let body = resp_body.to_string();
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn sync_list_failure_names_the_daemon() {
+    let dir = tmpdir("sync-list-hint");
+    let kdbx = dir.join("test.kdbx");
+    let journal_path = dir.join("sync.db");
+    fixture_kdbx(&kdbx);
+    let base = spawn_failing_list_stub();
+    let out = Command::new(bin())
+        .args([
+            "sync",
+            "--kdbx",
+            kdbx.to_str().unwrap(),
+            "--journal",
+            journal_path.to_str().unwrap(),
+            "--bw-url",
+            &base,
+        ])
+        .env("KBS_MASTER_PASSWORD", "test-password")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "sync with a failing item listing must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is `bw serve` running and unlocked?"),
+        "expected the daemon hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn quarantine_help_documents_the_bare_list() {
+    let out = Command::new(bin())
+        .args(["quarantine", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "quarantine --help must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("lists open rows"),
+        "help must document the bare list, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn sync_journal_defaults_to_sibling_of_vault() {
+    // Hold the sibling journal's lock: a sync without --journal must
+    // fail fast on that lock, proving it resolved to the sibling path;
+    // an explicit --journal elsewhere must get past it (and fail later
+    // on the dead daemon, not on the lock).
+    use fs2::FileExt;
+    let dir = tmpdir("sync-journal-default");
+    let kdbx = dir.join("test.kdbx");
+    let sibling = dir.join("sync.db");
+    fixture_kdbx(&kdbx);
+    let lock_path = {
+        let mut p = sibling.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    let lock_file = std::fs::File::create(&lock_path).unwrap();
+    lock_file.try_lock_exclusive().unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "sync",
+            "--kdbx",
+            kdbx.to_str().unwrap(),
+            "--bw-url",
+            "http://127.0.0.1:1",
+        ];
+        args.extend_from_slice(extra);
+        Command::new(bin())
+            .args(&args)
+            .env("KBS_MASTER_PASSWORD", "test-password")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("journal lock"),
+        "sync without --journal must hit the sibling lock, got: {stderr}"
+    );
+    let other = dir.join("other.db");
+    let out = run(&["--journal", other.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("journal lock"),
+        "explicit --journal must bypass the sibling lock, got: {stderr}"
+    );
+}
+
+#[test]
+fn restore_journal_defaults_to_sibling_of_vault() {
+    // Same lock trick as the sync default: restore without --journal
+    // must fail fast on the sibling journal's lock (the lock is taken
+    // before any vault or daemon work).
+    use fs2::FileExt;
+    let dir = tmpdir("restore-journal-default");
+    let kdbx = dir.join("restored.kdbx");
+    let sibling = dir.join("sync.db");
+    let lock_path = {
+        let mut p = sibling.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    let lock_file = std::fs::File::create(&lock_path).unwrap();
+    lock_file.try_lock_exclusive().unwrap();
+    let out = Command::new(bin())
+        .args([
+            "restore",
+            "--kdbx",
+            kdbx.to_str().unwrap(),
+            "--bw-url",
+            "http://127.0.0.1:1",
+        ])
+        .env("KBS_MASTER_PASSWORD", "new-vault-password")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("journal lock"),
+        "restore without --journal must hit the sibling lock, got: {stderr}"
+    );
+}
+
+#[test]
+fn put_master_password_prompt_runs_before_lock() {
+    // Order proof without a TTY: hold the journal lock, spawn put via
+    // setsid (no controlling terminal) with piped stdin secrets and NO
+    // env password. New order: stdin secrets read, then the prompt
+    // fails (no TTY) BEFORE the lock is attempted — so the error must
+    // NOT be a lock error. Control: with the env password set, the same
+    // setup MUST fail on the lock, proving the lock still gates.
+    use fs2::FileExt;
+    let dir = tmpdir("put-prompt-order");
+    let kdbx = dir.join("test.kdbx");
+    let journal_path = dir.join("sync.db");
+    fixture_kdbx(&kdbx);
+    let lock_path = {
+        let mut p = journal_path.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    let lock_file = std::fs::File::create(&lock_path).unwrap();
+    lock_file.try_lock_exclusive().unwrap();
+    let run = |env_pw: bool| {
+        let mut cmd = Command::new("setsid");
+        cmd.args([
+            "--wait",
+            bin().to_str().unwrap(),
+            "put",
+            "--kdbx",
+            kdbx.to_str().unwrap(),
+            "--journal",
+            journal_path.to_str().unwrap(),
+            "--title",
+            "put-prompt-test",
+            "--password-stdin",
+        ]);
+        if env_pw {
+            cmd.env("KBS_MASTER_PASSWORD", "test-password");
+        } else {
+            cmd.env_remove("KBS_MASTER_PASSWORD");
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"put-secret\n").unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+    let out = run(false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !stderr.contains("journal lock"),
+        "without env password the prompt must fail before the lock, got: {stderr}"
+    );
+    let out = run(true);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("journal lock"),
+        "with env password the held lock must still gate, got: {stderr}"
+    );
+}

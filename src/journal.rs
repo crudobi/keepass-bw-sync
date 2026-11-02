@@ -16,6 +16,52 @@ use uuid::Uuid;
 /// succeeds would let the journal claim KeePass mutations that never reached
 /// disk — a mid-apply bail or crash then corrupts the next run's conflict
 /// decisions (silent loss of foreign edits, or resurrection of deleted items).
+/// Symlink-safe throwaway journal copy for `--dry-run`.
+///
+/// The old construction (`kbs-dry-run-{pid}.db` via `std::fs::copy`)
+/// was predictable-name + truncate + symlink-following: a pre-planted
+/// symlink at that path would receive journal bytes (hashes + titles).
+/// This creates the destination with O_EXCL (`create_new`) under a
+/// random suffix (nanosecond clock xored with the pid and a counter,
+/// retried on collision), then streams the journal bytes into it — a
+/// planted link can never be followed, and the name cannot be predicted
+/// before creation. The copy is chmodded 0600 like the real journal.
+/// When the source journal does not exist yet, an empty file is created
+/// (SQLite initializes it on open, as before).
+pub fn create_dry_run_copy(
+    journal: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            ^ ((std::process::id() as u128) << 64)
+            ^ (COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128);
+        let p = dir.join(format!("kbs-dry-run-{nonce:x}.db"));
+        let mut dest = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).context("create dry-run journal copy"),
+        };
+        if journal.exists() {
+            let mut src = std::fs::File::open(journal).context("open journal for dry run")?;
+            std::io::copy(&mut src, &mut dest).context("copy journal for dry run")?;
+        }
+        #[cfg(unix)]
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .context("chmod dry-run journal copy")?;
+        return Ok(p);
+    }
+    anyhow::bail!("could not create a dry-run journal copy after 100 attempts");
+}
+
 #[derive(Debug)]
 pub enum JournalOp {
     UpsertMapping {
@@ -35,6 +81,12 @@ pub enum JournalOp {
     /// (adopt confirmation, or reconciliation of a stale row). Kind-scoped
     /// on purpose: other kinds still need human review.
     ResolveUnmappedForBw {
+        bw_id: String,
+    },
+    /// Resolve open `orphan_bw_stamp` rows for one Bitwarden item
+    /// (interrupted-adopt recovery: the stamp's entry now exists).
+    /// Kind-scoped on purpose, like ResolveUnmappedForBw.
+    ResolveOrphanForBw {
         bw_id: String,
     },
     Quarantine {
@@ -464,6 +516,18 @@ impl Journal {
         Ok(n)
     }
 
+    /// Resolve open `orphan_bw_stamp` rows for one Bitwarden item.
+    /// Kind-scoped: other kinds still need human review.
+    /// Returns rows resolved.
+    pub fn resolve_orphan_for_bw(&self, bw_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE quarantine SET resolved = 1 WHERE resolved = 0
+             AND kind = 'orphan_bw_stamp' AND bw_id = ?1",
+            params![bw_id],
+        )?;
+        Ok(n)
+    }
+
     /// Reconcile stale unmapped rows: an open `unmapped-bw-item` row whose
     /// item is now live-mapped (adopted, or mapped by any other path)
     /// states something false, so resolve it. Scoped narrowly to that
@@ -548,6 +612,9 @@ impl Journal {
                 JournalOp::ResolveUnmappedForBw { bw_id } => {
                     self.resolve_unmapped_for_bw(bw_id).map(|_| ())
                 }
+                JournalOp::ResolveOrphanForBw { bw_id } => {
+                    self.resolve_orphan_for_bw(bw_id).map(|_| ())
+                }
                 JournalOp::Quarantine { kind, kp_uuid, bw_id, title, detail } => {
                     self.quarantine(kind, kp_uuid.as_ref(), bw_id.as_deref(), title, detail)
                 }
@@ -623,6 +690,19 @@ mod tests {
         let rows = j.list_quarantine().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "foreign-bw-edit");
+    }
+
+    #[test]
+    fn resolve_orphan_for_bw_is_kind_scoped() {
+        let j = test_journal();
+        j.quarantine("orphan_bw_stamp", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        assert_eq!(j.resolve_orphan_for_bw("bw-1").unwrap(), 1);
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "unmapped-bw-item");
     }
 
     #[test]

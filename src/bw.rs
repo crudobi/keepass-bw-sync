@@ -344,9 +344,11 @@ struct Created {
 ///
 /// Bitwarden rate-limits cipher writes; when the limit trips, `bw serve`
 /// answers either HTTP 429 directly or — as observed 2026-10-15 — HTTP 400
-/// whose message embeds the upstream `status code 429 Too Many Requests`
-/// text (with a `Try again in Ns` hint). Both shapes retry; anything else
-/// fails exactly as before.
+/// whose message embeds the upstream `status code 429` marker (with a
+/// `Try again in Ns` hint). Detection is keyed on the status plus that
+/// specific marker: the generic `Too Many Requests` phrase alone never
+/// triggers a retry, since unrelated 400 bodies can carry it. Anything
+/// else fails exactly as before.
 ///
 /// Delay: the parsed hint when present (capped at 30s), else exponential
 /// backoff 1s, 2s, 4s, 8s, … capped at 30s. At most 5 attempts per call.
@@ -361,9 +363,14 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// `None` when this response is not a rate limit.
 fn rate_limit_delay(status: reqwest::StatusCode, body: &[u8], retry: usize) -> Option<Duration> {
     let text = String::from_utf8_lossy(body);
+    // Detection is keyed on the status, not on body text: the generic
+    // phrase matches unrelated 400 bodies. The one exception is serve's
+    // observed wrapping shape — a 400 embedding the specific upstream
+    // marker "status code 429" (October 2026 incident). Body text
+    // otherwise only supplies the retry hint within a confirmed
+    // rate-limit response.
     let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || text.contains("status code 429")
-        || text.contains("Too Many Requests");
+        || (status == reqwest::StatusCode::BAD_REQUEST && text.contains("status code 429"));
     if !limited {
         return None;
     }
@@ -378,20 +385,41 @@ fn rate_limit_delay(status: reqwest::StatusCode, body: &[u8], retry: usize) -> O
     Some(Duration::from_secs(secs).min(BACKOFF_CAP))
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+/// True when every address in the list is loopback. Empty lists fail:
+/// a name that resolves to nothing is not a loopback host.
+fn all_addrs_loopback(addrs: impl IntoIterator<Item = std::net::IpAddr>) -> bool {
+    let mut any = false;
+    for ip in addrs {
+        any = true;
+        if !ip.is_loopback() {
+            // 127.0.0.0/8 and ::1 only.
+            return false;
+        }
     }
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback()) // 127.0.0.0/8 and ::1
-        .unwrap_or(false)
+    any
+}
+
+/// True when `host` is loopback. IP literals are checked directly;
+/// names go through the resolver and fail closed on empty or
+/// unresolvable results — a poisoned `localhost` mapping must not
+/// redirect the plaintext vault transport elsewhere.
+fn is_loopback_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    use std::net::ToSocketAddrs;
+    match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => all_addrs_loopback(addrs.map(|a| a.ip())),
+        Err(_) => false,
+    }
 }
 
 /// Validate a `bw serve` base URL with a real URL parser. A hand-rolled
 /// host extraction had a parser differential: `http://example.com#@127.0.0.1:8087/`
 /// read as loopback (the `#` fragment confused the split) while reqwest
 /// connected to example.com. Scheme must be http, the parsed host
-/// 127.0.0.0/8, ::1, or localhost, and userinfo is refused outright (it has
+/// 127.0.0.0/8, ::1, or a name resolving only to loopback, and userinfo
+/// is refused outright (it has
 /// no legitimate use here, only parser confusion).
 fn validate_loopback_url(base: &str) -> Result<()> {
     let url = reqwest::Url::parse(base)
@@ -1379,6 +1407,53 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(rate_limit_delay(StatusCode::OK, b"{}", 1), None);
+    }
+
+    #[test]
+    fn rate_limit_delay_ignores_generic_phrase_on_400() {
+        use reqwest::StatusCode;
+        // An unrelated 400 body mentioning the generic phrase is not a
+        // rate limit (the old substring match fired on this shape).
+        assert_eq!(
+            rate_limit_delay(
+                StatusCode::BAD_REQUEST,
+                b"{\"message\":\"Too Many Requests from upstream proxy\"}",
+                1
+            ),
+            None
+        );
+        // ... but the specific upstream marker keeps the observed
+        // serve-wrapping shape retrying.
+        assert_eq!(
+            rate_limit_delay(StatusCode::BAD_REQUEST, wrapped_429_body().as_bytes(), 1),
+            Some(Duration::from_secs(1))
+        );
+        // And a plain 429 still retries.
+        assert_eq!(
+            rate_limit_delay(StatusCode::TOO_MANY_REQUESTS, b"Slow down!", 1),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn loopback_check_requires_all_resolved_addresses_loopback() {
+        use std::net::IpAddr;
+        let lo4: IpAddr = "127.0.0.1".parse().unwrap();
+        let lo6: IpAddr = "::1".parse().unwrap();
+        let pub4: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(all_addrs_loopback([lo4, lo6]));
+        assert!(all_addrs_loopback([lo4]));
+        assert!(!all_addrs_loopback([lo4, pub4]));
+        assert!(!all_addrs_loopback(std::iter::empty::<IpAddr>()));
+    }
+
+    #[test]
+    fn loopback_host_names_resolve_and_fail_closed() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("nonexistent.invalid"));
     }
 
     #[test]

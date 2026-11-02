@@ -327,9 +327,11 @@ pub fn tombstoned_uuids(db: &Database) -> HashSet<Uuid> {
 ///
 /// The rename replaces the vault file, so the temp file's permissions are
 /// what the vault ends up with: a umask-default temp (typically 0644)
-/// would silently relax an owner-only vault. The existing vault's mode is
-/// therefore applied to the temp file at creation; a brand-new vault
-/// starts 0600.
+/// would silently relax an owner-only vault. The temp file is therefore
+/// always created 0600 — a save also tightens a vault that ever became
+/// wider (KeePassXC save, backup restore under a loose umask, chmod
+/// accident), the same discipline as the journal, which chmods 0600 on
+/// every open.
 ///
 /// The temp path is opened `O_EXCL` (`create_new`), never `File::create`
 /// (which follows symlinks): a symlink planted at the tmp path can never
@@ -339,14 +341,12 @@ pub fn tombstoned_uuids(db: &Database) -> HashSet<Uuid> {
 /// `create_new`, so a link re-planted in the gap fails closed too
 /// instead of being followed.
 pub fn save_vault(v: &KdbxVault) -> Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     let key = build_key(&v.password, v.keyfile.as_deref())?;
     let tmp = v.path.with_extension("kdbx.tmp");
+    // Owner-only, always (see the doc comment above): never preserve a
+    // wider pre-existing mode.
     #[cfg(unix)]
-    let mode = std::fs::metadata(&v.path)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
+    let mode = 0o600;
     {
         let open_tmp = || {
             let mut opts = std::fs::OpenOptions::new();
@@ -1195,13 +1195,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn save_vault_preserves_permissions() {
+    fn save_vault_tightens_to_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("kbs-save-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Pre-existing vault with a non-default mode: the rename must not
-        // relax (or tighten) it.
+        // Pre-existing vault with a wider mode: the save tightens it to
+        // 0600 (a vault that ever became group/world-readable must not
+        // stay readable indefinitely).
         let path = dir.join("vault.kdbx");
         std::fs::write(&path, b"placeholder").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -1210,7 +1211,7 @@ mod tests {
         v.path = path.clone();
         save_vault(&v).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "save must preserve the existing vault mode");
+        assert_eq!(mode, 0o600, "save must tighten a wider vault mode to 0600");
 
         // Brand-new vault starts owner-only.
         let path2 = dir.join("fresh.kdbx");

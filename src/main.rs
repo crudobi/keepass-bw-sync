@@ -32,8 +32,9 @@ enum Cmd {
         #[arg(long, env = "KBS_KEYFILE")]
         keyfile: Option<PathBuf>,
         /// Path to the SQLite sync journal (created if missing).
+        /// Defaults to `sync.db` next to the vault.
         #[arg(long)]
-        journal: PathBuf,
+        journal: Option<PathBuf>,
         /// Base URL of a running, unlocked `bw serve`.
         #[arg(long, default_value = "http://127.0.0.1:8087")]
         bw_url: String,
@@ -73,8 +74,9 @@ enum Cmd {
         #[arg(long, env = "KBS_KEYFILE")]
         keyfile: Option<PathBuf>,
         /// Path to the SQLite sync journal to create (created if missing).
+        /// Defaults to `sync.db` next to the vault.
         #[arg(long)]
-        journal: PathBuf,
+        journal: Option<PathBuf>,
         /// Base URL of a running, unlocked `bw serve`.
         #[arg(long, default_value = "http://127.0.0.1:8087")]
         bw_url: String,
@@ -83,7 +85,7 @@ enum Cmd {
         #[arg(long)]
         insecure_remote_url: bool,
     },
-    /// Manage the quarantine queue.
+    /// Manage the quarantine queue. With no subcommand, lists open rows.
     Quarantine {
         #[arg(long)]
         journal: PathBuf,
@@ -116,8 +118,9 @@ enum Cmd {
     /// with --update). Secret material comes only from stdin or a file,
     /// never argv (argv is visible in `ps`). Reads/writes the local .kdbx
     /// only: no journal writes, no Bitwarden. The journal flock is held
-    /// for the modify-save only (stdin is read before the lock) so an
-    /// interactive put waiting on stdin cannot block the hourly sync;
+    /// for the modify-save only (stdin secrets and the master-password
+    /// prompt are read before the lock) so an interactive put waiting
+    /// on stdin cannot block the hourly sync;
     /// put and sync still cannot race the vault save.
     Put {
         /// Path to the KeePass2 database.
@@ -312,6 +315,13 @@ fn describe_action(a: &Action, entries: &[CanonicalEntry], items: &[BwItem]) -> 
             let it = &items[*item_idx];
             format!("AdoptBwNew title={:?} bw={}", it.name, it.id)
         }
+        Action::AdoptBwStamped { item_idx, uuid } => {
+            let it = &items[*item_idx];
+            format!(
+                "AdoptBwStamped title={:?} bw={} kp={}",
+                it.name, it.id, uuid
+            )
+        }
         Action::WritebackEdit { bw_id, kp_uuid, item_idx } => {
             let title = items
                 .get(*item_idx)
@@ -343,6 +353,9 @@ fn main() -> Result<()> {
             dry_run,
             insecure_remote_url,
         } => {
+            // --journal defaults to sync.db next to the vault (same as
+            // put): resolve before the lock, which needs the real path.
+            let journal = journal.unwrap_or_else(|| kdbx.with_file_name("sync.db"));
             let _lock = acquire_journal_lock(&journal)?;
 
             let opts = SyncOpts {
@@ -361,10 +374,14 @@ fn main() -> Result<()> {
             let bw = BwClient::new_with_remote(&bw_url, insecure_remote_url)?;
             bw.sync()
                 .context("bw sync failed — is `bw serve` running and unlocked?")?;
-            let items = bw.list_items()?;
+            let items = bw
+                .list_items()
+                .context("bw list items failed — is `bw serve` running and unlocked?")?;
             // Fail closed: a transient folder-list failure must not silently
             // duplicate server folders (the CreateBw path creates them).
-            let folders = bw.list_folders().context("list bitwarden folders")?;
+            let folders = bw
+                .list_folders()
+                .context("bw list folders failed — is `bw serve` running and unlocked?")?;
             // Dry run: plan against a throwaway copy of the journal, so
             // plan()'s immediate bookkeeping (mapping rebuild, missing
             // notes, watermark refresh) can never touch the real journal.
@@ -385,22 +402,15 @@ fn main() -> Result<()> {
                 }
             }
             let tmp_journal: Option<PathBuf> = if dry_run {
-                let p = std::env::temp_dir()
-                    .join(format!("kbs-dry-run-{}.db", std::process::id()));
-                if journal.exists() {
-                    std::fs::copy(&journal, &p).context("copy journal for dry run")?;
-                    // The journal holds hashes and titles, not secrets —
-                    // but a 0644 copy in a shared temp dir is still wider
-                    // than the 0600 the real journal carries, so narrow it
-                    // immediately (Journal::open re-chmods on open anyway).
-                    #[cfg(unix)]
-                    std::fs::set_permissions(
-                        &p,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
-                    )
-                    .context("chmod dry-run journal copy")?;
-                }
-                Some(p)
+                // Symlink-safe copy (O_EXCL + random suffix): see
+                // `create_dry_run_copy` in the journal module. The
+                // journal holds hashes and titles, not secrets — but a
+                // copy in a shared temp dir is still chmodded 0600 like
+                // the real journal.
+                Some(keepass_bw_sync::journal::create_dry_run_copy(
+                    &journal,
+                    &std::env::temp_dir(),
+                )?)
             } else {
                 None
             };
@@ -465,6 +475,9 @@ fn main() -> Result<()> {
             bw_url,
             insecure_remote_url,
         } => {
+            // --journal defaults to sync.db next to the vault (same as
+            // put/sync): resolve before the lock, which needs the real path.
+            let journal = journal.unwrap_or_else(|| kdbx.with_file_name("sync.db"));
             let _lock = acquire_journal_lock(&journal)?;
 
             let pw = restore_master_password()?;
@@ -495,7 +508,9 @@ fn main() -> Result<()> {
             let items = bw
                 .list_items()
                 .context("bw list items failed — is `bw serve` running and unlocked?")?;
-            let folders = bw.list_folders().context("list bitwarden folders")?;
+            let folders = bw
+                .list_folders()
+                .context("bw list folders failed — is `bw serve` running and unlocked?")?;
             let (report, journal_ops) = restore_into(&mut vault.db, &items, &folders)?;
             // Journal opens (creating it when missing) only after the
             // restore computed cleanly in memory; the vault saves before
@@ -618,22 +633,31 @@ fn main() -> Result<()> {
             notes_file,
             update,
         } => {
-            // Same flock discipline as sync, held for the whole
-            // read-modify-save: put and sync share the vault file and its
-            // .kdbx.tmp path, and a racing sync save used to silently
-            // erase a put entry (its older in-memory DB renamed over the
-            // put, with nothing anywhere detecting the loss). The lock
-            // is taken AFTER reading stdin: an interactive put waiting
-            // on stdin must not block the hourly sync (which fails fast
-            // on a contended lock) -- only the read-modify-save itself
-            // needs the lock.
+            // Same flock discipline as sync, held for the modify-save
+            // only: put and sync share the vault file and its .kdbx.tmp
+            // path, and a racing sync save used to silently erase a put
+            // entry (its older in-memory DB renamed over the put, with
+            // nothing anywhere detecting the loss). The lock is taken
+            // AFTER reading stdin and AFTER the master-password prompt:
+            // an interactive put waiting on either must not block the
+            // hourly sync (which fails fast on a contended lock) -- only
+            // the read-modify-save itself needs the lock.
             let journal_path = journal.unwrap_or_else(|| kdbx.with_file_name("sync.db"));
 
             let password =
                 read_secret_input("password", password_stdin, password_file.as_deref())?;
             let notes = read_secret_input("notes", notes_stdin, notes_file.as_deref())?;
+            // The master-password prompt runs BEFORE the lock, like the
+            // stdin reads above: open_cli_vault prompts after the lock,
+            // so a user idling at the prompt used to make the hourly
+            // timer fail fast (one missed run, self-healing next hour).
+            // Env vs prompt precedence and terminal refusal are
+            // unchanged — master_password() itself is untouched.
+            let pw = master_password()?;
+            let kf = load_keyfile(&keyfile)?;
             let _lock = acquire_journal_lock(&journal_path)?;
-            let mut vault = open_cli_vault(&kdbx, &keyfile)?;
+            let mut vault = open_vault(&kdbx, &pw, kf.as_deref())?;
+            drop(pw);
             // KDBX3 is read-only for this tool: refuse before mutating.
             vault.require_writable()?;
             let title_msg = title.clone();
