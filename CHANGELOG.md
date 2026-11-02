@@ -130,3 +130,19 @@
   adopt stamp-back, journal reset.
 - Publish prep: MIT license, package metadata, de-personalized docs
   and examples.
+
+## Open-items batch (2026-11-01)
+
+- Plan-to-apply org race closed: edit and stamp payloads echo
+  collectionIds from the re-read item when non-empty; the next
+  sync plan gate quarantining as org-item is the backstop.
+- put reads stdin before taking the journal flock, so an
+  interactive put no longer blocks the hourly sync.
+- Folder-listing guard: an empty folder listing with
+  folder-referencing items fails closed, no changes made.
+- New plan gates (all flag modes, before any mutation):
+  totp-name-collision and duplicate-field-name quarantines.
+- Otpauth label percent-encoded per RFC 3986.
+- missing_bw rows are deleted with their mapping.
+- bw-serve.sh unlock stderr now goes to a 0600 mktemp file,
+  removed on exit (takes effect on next service restart).
