@@ -274,7 +274,22 @@ pub fn plan(
                     // present-but-trashed, not missing.)
                     if journal.was_missing(&bw_id)? {
                         journal.clear_missing(&bw_id)?;
-                        actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                        // Mirror the present-but-trashed arm: a KeePass
+                        // edit since the watermark turns a confirmed
+                        // absence into delete-vs-edit, not a recycle —
+                        // otherwise a live edit would land in the bin
+                        // on the strength of a listing absence alone.
+                        if e.content_hash_hex() != last_hash {
+                            actions.push(Action::Quarantine(QuarantineCase {
+                                kind: "delete-vs-edit",
+                                kp_uuid: Some(e.uuid),
+                                bw_id: Some(bw_id),
+                                title: e.title.clone(),
+                                detail: "item is absent from the Bitwarden listing but the KeePass entry changed since last sync".into(),
+                            }));
+                        } else {
+                            actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                        }
                     } else {
                         journal.note_missing(&bw_id, &e.uuid)?;
                     }
@@ -855,6 +870,37 @@ mod tests {
         let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &SyncOpts::default()).unwrap();
         assert_eq!(p.actions.len(), 1);
         assert!(matches!(p.actions[0], Action::RecycleKp { .. }));
+    }
+
+    #[test]
+    fn partial_listing_missing_with_kp_edit_quarantines() {
+        // Mirror of the trashed arm's delete-vs-edit: a KeePass edit
+        // since the watermark plus a second confirmed absence must
+        // quarantine, not recycle — the edit is live data, and a
+        // listing absence alone is not proof of a delete.
+        let j = test_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        let listed: Vec<BwItem> = items[..3].to_vec();
+        let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "first sighting must not recycle");
+        assert!(j.was_missing("bw-4").unwrap());
+        kp[3].title = "edited locally".into();
+        let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(
+            matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "delete-vs-edit"),
+            "expected delete-vs-edit quarantine, got {:?}", p.actions[0]
+        );
+        assert!(
+            !j.was_missing("bw-4").unwrap(),
+            "missing record must clear so the case does not churn"
+        );
     }
 
     #[test]

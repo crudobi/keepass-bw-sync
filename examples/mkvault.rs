@@ -1,7 +1,7 @@
 //! One-off init tool: create an empty KDBX4 vault for production use.
 //!
 //! Usage: KBS_MASTER_PASSWORD must be set in the environment, then
-//!   cargo run --offline --example mkvault -- $SECRETS_DIR/vault.kdbx
+//!   cargo run --example mkvault -- $SECRETS_DIR/vault.kdbx
 //!
 //! Fails closed when KBS_MASTER_PASSWORD is unset or empty; the password is
 //! zeroized after use. Documented as a one-off: the production password lives

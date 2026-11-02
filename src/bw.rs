@@ -337,6 +337,10 @@ impl BwClient {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
+            // No proxy, ever: without this, HTTP(S)_PROXY env vars would
+            // route loopback plaintext through a proxy. The client only
+            // ever talks to `bw serve`, so proxying can never be wanted.
+            .no_proxy()
             .build()
             .context("build reqwest client")?;
         Ok(BwClient {

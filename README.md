@@ -106,14 +106,34 @@ Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
 ### Bitwarden CLI setup (one time)
 
 The engine only ever talks to a local `bw serve`; it never contacts
-bitwarden.com directly. Get that server running first:
+bitwarden.com directly. Get that server running first.
+
+Install `bw` if it is not already present: the native binary from
+bitwarden.com/download, or `npm install -g @bitwarden/cli`.
 
 ```sh
-bw login            # or: bw login --apikey (headless / 2FA accounts)
-bw unlock           # note the session key
+bw login            # interactive: email + password, then 2FA if enabled
+bw unlock --raw     # prints only the session key; capture it cleanly
 export BW_SESSION=<key from bw unlock>
 bw serve --port 8087 &
 ```
+
+Headless / 2FA accounts: log in with an API key instead. Create the key
+in the web vault (Settings → Security → Keys), then:
+
+```sh
+export BW_CLIENTID=<client_id> BW_CLIENTSECRET=<client_secret>
+bw login --apikey   # reads the pair from those env vars, no prompt
+bw unlock --raw
+export BW_SESSION=<key from bw unlock>
+bw serve --port 8087 &
+```
+
+Notes: an API-key login authenticates but does not unlock — you still
+unlock with the master password. Interactive 2FA is `bw login --method
+<method> --code <code>` (see `bw login --help` for method values).
+`--raw` on both `login` and `unlock` prints only the session key, so
+`export BW_SESSION=$(bw unlock --raw)` captures it without parsing.
 
 For unattended use, `deploy/systemd/bw-serve.service` automates this
 (headless re-login via API key, 2FA-safe) — see
@@ -163,11 +183,13 @@ What it restores:
   rule). A subsequent `sync` against the restored vault + new journal +
   the same Bitwarden state plans **0 actions**.
 
-No-Bitwarden-writes guarantee: restore issues only the two GET list
-calls (`list_items`, `list_folders`) — no `bw sync` POST, no creates,
-edits, trash, or stamps. Unstamped items are deliberately NOT stamped
-back: stamping would be a Bitwarden write, and restore must not mutate
-the source it is recovering from.
+No-server-writes guarantee: restore first refreshes serve's local
+cache with a download-only `bw.sync()` (it mutates no server vault —
+without it, a stale cache could silently under-restore), then issues
+only the two GET list calls (`list_items`, `list_folders`) — no
+creates, edits, trash, or stamps. Unstamped items are deliberately NOT
+stamped back: stamping would be a Bitwarden write, and restore must
+not mutate the source it is recovering from.
 
 Unstamped-orphan caveat (stated, not silent): because unstamped items
 are not stamped back, their only identity record is the new journal. If

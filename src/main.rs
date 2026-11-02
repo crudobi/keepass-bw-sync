@@ -50,8 +50,10 @@ enum Cmd {
         #[arg(long)]
         insecure_remote_url: bool,
     },
-    /// Rebuild a KeePass vault from Bitwarden. NEVER writes to Bitwarden:
-    /// only the two GET list calls run; stamped items keep their stamp
+    /// Rebuild a KeePass vault from Bitwarden. NEVER writes to the
+    /// Bitwarden server vault: a download-only `bw.sync()` refreshes
+    /// serve's cache, then only the two GET list calls run; stamped
+    /// items keep their stamp
     /// UUIDs, unstamped items are adopted under fresh UUIDs (and NOT
     /// stamped back), trashed items are skipped. Refuses to restore into
     /// an existing non-empty vault. The new vault's password comes from
@@ -355,11 +357,17 @@ fn main() -> Result<()> {
             vault.require_writable()?;
             check_target_empty(&vault.db)?;
 
-            // GETs only, and deliberately no `bw.sync()`: restore must not
-            // mutate Bitwarden in any way, and a POST /sync is not a read.
-            // The restore module takes only the fetched slices — it has no
-            // client handle, so no Bitwarden write can originate from it.
+            // Refresh serve's local cache first: without `bw.sync()`, a
+            // stale cache can miss recently added items or still list
+            // server-deleted ones, and restore would silently
+            // under-restore while reporting success. `bw.sync()` is a
+            // download-only POST — it mutates no server vault — so the
+            // no-server-writes guarantee below still holds. The restore
+            // module takes only the fetched slices — it has no client
+            // handle, so no Bitwarden write can originate from it.
             let bw = BwClient::new_with_remote(&bw_url, insecure_remote_url)?;
+            bw.sync()
+                .context("bw sync failed — is `bw serve` running and unlocked?")?;
             let items = bw
                 .list_items()
                 .context("bw list items failed — is `bw serve` running and unlocked?")?;

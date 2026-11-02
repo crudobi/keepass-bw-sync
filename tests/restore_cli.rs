@@ -1,7 +1,8 @@
 //! CLI-level restore tests against a stub `bw serve`.
 //!
 //! Runs the real binary: restore must create a vault + journal from the
-//! stub's items (GETs only), keep stamp UUIDs, skip trashed items, and
+//! stub's items (one download-only POST /sync, then the GET list calls),
+//! keep stamp UUIDs, skip trashed items, and
 //! then refuse a second restore into the now non-empty vault without
 //! touching it. A restore without `KBS_MASTER_PASSWORD` fails closed.
 
@@ -85,6 +86,7 @@ fn spawn_stub(methods: Arc<Mutex<Vec<String>>>) -> String {
                 .unwrap()
                 .push(format!("{} {}", parts[0], parts[1]));
             let resp_body = match (parts[0], parts[1]) {
+                ("POST", "/sync") => serde_json::json!({"success": true}),
                 ("GET", "/list/object/items") => serde_json::json!({
                     "success": true,
                     "data": {"object": "list", "data": [
@@ -178,14 +180,16 @@ fn restore_creates_vault_then_refuses_nonempty_target() {
         stdout.contains("restored stamped=1 unstamped=1 skipped_trashed=1"),
         "stdout: {stdout}"
     );
-    // GETs only: no POST/PUT/DELETE reached the stub, ever.
+    // One download-only POST /sync first, then the two GET list calls;
+    // no server-mutating POST/PUT/DELETE ever reaches the stub.
     assert_eq!(
         *methods.lock().unwrap(),
         vec![
+            "POST /sync".to_string(),
             "GET /list/object/items".to_string(),
             "GET /list/object/folders".to_string()
         ],
-        "restore must issue only the two GET list calls"
+        "restore must sync (download-only) before listing, and issue no server writes"
     );
 
     // The restored vault reopens with the stub password, the stamped
@@ -274,5 +278,78 @@ fn restore_fails_closed_without_password() {
     assert!(
         !kdbx.exists(),
         "failed restore must not create a vault file"
+    );
+}
+
+#[test]
+fn restore_syncs_before_listing() {
+    // Regression (2026-11-01 review): restore read a possibly stale
+    // `bw serve` cache because it never called `bw.sync()`, so it could
+    // silently under-restore while reporting success. The listing step
+    // must be preceded by the download-only sync POST.
+    let dir = tmpdir("sync-first");
+    let kdbx = dir.join("restored.kdbx");
+    let journal = dir.join("sync.db");
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let base = spawn_stub(methods.clone());
+
+    let out = restore_cmd(&kdbx, &journal, &base).output().unwrap();
+    assert!(
+        out.status.success(),
+        "restore failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        *methods.lock().unwrap(),
+        vec![
+            "POST /sync".to_string(),
+            "GET /list/object/items".to_string(),
+            "GET /list/object/folders".to_string()
+        ],
+        "restore must sync (download-only) before listing"
+    );
+}
+
+#[test]
+fn restore_ignores_proxy_env() {
+    // Regression (2026-11-01 review): without `.no_proxy()`, proxy env
+    // vars route loopback plaintext through the proxy. The child runs
+    // with a dead proxy set (and NO_PROXY removed, so a proxy-respecting
+    // client would actually use it) and must still reach the stub.
+    let dir = tmpdir("no-proxy");
+    let kdbx = dir.join("restored.kdbx");
+    let journal = dir.join("sync.db");
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let base = spawn_stub(methods.clone());
+
+    let mut c = restore_cmd(&kdbx, &journal, &base);
+    for v in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        c.env(v, "http://127.0.0.1:1");
+    }
+    c.env_remove("NO_PROXY");
+    c.env_remove("no_proxy");
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "restore behind a dead proxy failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        *methods.lock().unwrap(),
+        vec![
+            "POST /sync".to_string(),
+            "GET /list/object/items".to_string(),
+            "GET /list/object/folders".to_string()
+        ],
+        "restore must reach the stub directly despite proxy env"
     );
 }

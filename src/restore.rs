@@ -1,12 +1,14 @@
 //! Rebuild a KeePass vault from Bitwarden (`restore` subcommand).
 //!
-//! RESTORE NEVER WRITES TO BITWARDEN. This module is the structural
-//! guarantee: it takes already-fetched `&[BwItem]` / `&[BwFolder]`
-//! slices and a `&mut Database` — it has no `BwClient`, no HTTP, and no
-//! way to issue a Bitwarden write. The CLI arm that calls it performs
-//! only the two GET list calls (`list_items`, `list_folders`); it never
-//! calls `bw.sync()`, `create_*`, `edit_item`, `trash_item`, or
-//! `stamp_item`. In particular, unstamped items are NOT stamped back:
+//! RESTORE NEVER WRITES TO THE BITWARDEN SERVER VAULT. This module is
+//! the structural guarantee: it takes already-fetched `&[BwItem]` /
+//! `&[BwFolder]` slices and a `&mut Database` — it has no `BwClient`,
+//! no HTTP, and no way to issue a Bitwarden write. The CLI arm that
+//! calls it first refreshes serve's local cache with `bw.sync()` — a
+//! download-only POST that mutates no server vault — then performs only
+//! the two GET list calls (`list_items`, `list_folders`); it never calls
+//! `create_*`, `edit_item`, `trash_item`, or `stamp_item`. In
+//! particular, unstamped items are NOT stamped back:
 //! stamping would be a Bitwarden write, and restore must not mutate the
 //! source it is recovering from.
 //!
