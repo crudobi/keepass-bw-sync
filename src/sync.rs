@@ -176,7 +176,7 @@ fn duplicate_field_name(it: &BwItem) -> Option<&str> {
 ///   item is mapped). The only quarantine-table write plan makes, and
 ///   it only ever resolves -- plan never *creates* rows.
 ///
-/// Purity note (2026-11-01 review, refactor deliberately NOT taken): a
+/// Purity note [WILL NOT IMPLEMENT, user decision 2026-11-01]: a
 /// pure move — plan returns its journal writes as a delta for the caller
 /// to apply — was stopped, not attempted halfway. Later reads inside
 /// `plan()` observe its own earlier writes (the rebuild upsert feeds the
