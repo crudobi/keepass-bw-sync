@@ -349,13 +349,20 @@ chmod 600 "$SECRETS_DIR/vault.kdbx"
 
 ## Layout
 
+- `src/main.rs` — CLI (`sync`/`restore`/`quarantine`/`journal`/`get`/`put`/`list`)
 - `src/secret.rs` — zeroized secret newtype
 - `src/canonical.rs` — canonical entry model + content hashing
 - `src/kdbx.rs` — open/walk/save .kdbx (keepass 0.15)
 - `src/bw.rs` — `bw serve` client with revision guards
 - `src/journal.rs` — SQLite mappings, tombstones, quarantine
 - `src/sync.rs` — plan/apply engine + unit tests
+- `src/restore.rs` — rebuild a vault from Bitwarden (download-only)
+- `src/stamps.rs` — `KBS_SYNC_ID` / `KBS_SYNC_HASH` field names
 - `tests/integration.rs` — end-to-end vs a stub `bw serve`
+- `tests/restore_cli.rs` — CLI-level restore tests vs a stub `bw serve`
+- `examples/mkvault.rs` — one-off empty-vault creator (0600)
+- `examples/mkdb.rs` — fixture-vault builder for tests/drills
+- `examples/tweak.rs` — one-off entry editor (password via stdin)
 
 ## Roadmap
 

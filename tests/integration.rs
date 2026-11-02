@@ -157,6 +157,14 @@ fn tmpdir() -> std::path::PathBuf {
     d
 }
 
+fn tmpdir_tagged(tag: &str) -> std::path::PathBuf {
+    // The shared tmpdir() collides across tests in one binary run (same
+    // pid); crash-path tests need their own directory.
+    let d = std::env::temp_dir().join(format!("kbs-test-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
 #[test]
 fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
     let dir = tmpdir();
@@ -310,4 +318,81 @@ fn full_sync_flow_is_idempotent_and_quarantines_foreign_edits() {
         "adopted entry must carry the Bitwarden custom field after save/reopen, got {:?}",
         adopted.custom
     );
+}
+
+#[test]
+fn crash_between_vault_save_and_journal_commit_recovers_without_loss_or_duplicates() {
+    // The deferred-commit seam, driven faithfully: a --writeback run
+    // applies into the vault and saves it, then the process "crashes"
+    // before `apply_ops` — the journal ops are discarded, exactly as a
+    // kill between save_vault() and the journal commit would leave them.
+    // The next run must recover via watermark agreement: no duplicate
+    // Bitwarden items, no quarantine storm, no lost foreign edit.
+    let dir = tmpdir_tagged("crash");
+    let kdbx = dir.join("test.kdbx");
+    let journal_path = dir.join("sync.db");
+    fixture_kdbx(&kdbx);
+
+    let (base, state) = spawn_stub();
+    let bw = BwClient::new(&base).unwrap();
+    bw.sync().unwrap();
+
+    let pw = Secret::from_str("test-password");
+    let mut vault = open_vault(&kdbx, &pw, None).unwrap();
+    let journal = Journal::open(&journal_path).unwrap();
+
+    // Run 1: two creates, saved + committed normally.
+    let entries = extract_entries(&vault.db);
+    let tombstones = tombstoned_uuids(&vault.db);
+    let items = bw.list_items().unwrap();
+    let folders = bw.list_folders().unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &SyncOpts::default()).unwrap();
+    assert_eq!(p.actions.len(), 2);
+    let (_r, ops) = apply(&p, &entries, &items, &bw, &mut vault, &folders).unwrap();
+    save_vault(&vault).unwrap();
+    journal.apply_ops(&ops).unwrap();
+    assert_eq!(journal.live_mapping_count().unwrap(), 2);
+
+    // Foreign edit on the Bitwarden side, then a --writeback run that
+    // crashes between the vault save and the journal commit.
+    {
+        let mut st = state.lock().unwrap();
+        st.items[0]["name"] = "github (edited in bitwarden)".into();
+    }
+    let opts = SyncOpts { writeback: true, ..Default::default() };
+    let entries = extract_entries(&vault.db);
+    let tombstones = tombstoned_uuids(&vault.db);
+    let items = bw.list_items().unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &opts).unwrap();
+    assert_eq!(p.actions.len(), 1);
+    assert!(matches!(p.actions[0], Action::WritebackEdit { .. }));
+    let (r, _discarded_ops) = apply(&p, &entries, &items, &bw, &mut vault, &folders).unwrap();
+    assert_eq!(r.writeback_applied, 1);
+    save_vault(&vault).unwrap();
+    // CRASH: `_discarded_ops` are never committed.
+
+    // Recovery run: reopen the saved vault (the writeback landed on disk)
+    // and plan with default flags. Both sides now hold identical new
+    // content; only the watermark is behind, so the plan must be empty
+    // (agreement refreshes the watermark at plan time) — no UpdateBw,
+    // no quarantine, no duplicate Bitwarden item.
+    let vault = open_vault(&kdbx, &pw, None).unwrap();
+    let entries = extract_entries(&vault.db);
+    let tombstones = tombstoned_uuids(&vault.db);
+    let github = entries.iter().find(|e| e.title == "github (edited in bitwarden)").unwrap();
+    let items = bw.list_items().unwrap();
+    let p = plan(&entries, &tombstones, &items, &folders, &journal, &SyncOpts::default()).unwrap();
+    assert!(
+        p.actions.is_empty(),
+        "recovery run must be a no-op, got {} actions",
+        p.actions.len()
+    );
+    assert_eq!(journal.list_quarantine().unwrap().len(), 0, "no quarantine storm");
+    {
+        let st = state.lock().unwrap();
+        assert_eq!(st.items.len(), 2, "no duplicate Bitwarden items");
+    }
+    // The watermark caught up to the agreed content at plan time.
+    let (_, watermark) = journal.mapping_by_kp(&github.uuid).unwrap().unwrap();
+    assert_eq!(watermark, github.content_hash_hex());
 }

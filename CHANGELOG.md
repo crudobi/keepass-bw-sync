@@ -38,6 +38,10 @@
 - README documents placement sync, field-type preservation, multi-URI
   round-trip, and the restore procedure (drill-proven: 25/25 items,
   121/121 field hashes, KeePassXC-opened, zero Bitwarden writes).
+- Writeback now retains KeePassXC `TOTP Seed`/`TOTP Settings` and
+  KeePass2 `otp` when the Bitwarden item carries no TOTP (correction:
+  the 2026-10-15 entry overstated this as full writeback TOTP retention;
+  that batch kept only the literal `totp` field).
 
 ## 2026-10-15
 
@@ -50,7 +54,8 @@
   skip-and-quarantine, KeePassXC/KeePass2 TOTP recognition, `--keyfile`,
   field-type and favorite and multi-URI preservation, loopback guard via
   real URL parsing, tombstone bookkeeping for already-trashed items,
-  journal schema versioning, writeback TOTP retention.
+  journal schema versioning, writeback retention of only the literal
+  `totp` field (full Seed/Settings retention is the 2026-11-01 batch).
 - Hygiene pass: shared response gate, URI projection, path formatting,
   vault-open, and test fixtures deduplicated; narrative comments
   trimmed; dead `Secret::is_empty` removed. No behavior change.

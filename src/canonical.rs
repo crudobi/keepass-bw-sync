@@ -35,6 +35,13 @@ pub struct CanonicalEntry {
     pub group_path: String,
     /// True when the entry lives in the KeePass recycle bin.
     pub deleted: bool,
+    /// True when the KeePass entry carries binary attachments. The engine
+    /// does not sync attachments, so such entries quarantine (see
+    /// `plan`'s `has-attachments` case) instead of being created, edited,
+    /// stamped, or trashed. Attachments are deliberately NOT part of the
+    /// content hash: hashing binary blobs would make every attached entry
+    /// permanently disagree, and the quarantine already blocks all writes.
+    pub has_attachments: bool,
 }
 
 fn write_field(h: &mut Sha256, tag: &str, data: &[u8]) {

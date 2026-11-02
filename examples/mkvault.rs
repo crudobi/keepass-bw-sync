@@ -7,6 +7,7 @@
 //! zeroized after use. Documented as a one-off: the production password lives
 //! in $SECRETS_DIR/vault.env (0600, never printed, never committed).
 
+#[cfg(not(unix))]
 use std::fs::File;
 
 use zeroize::Zeroizing;
@@ -28,6 +29,20 @@ fn main() {
     db.root_mut().name = "Root".to_string();
 
     let key = keepass::DatabaseKey::new().with_password(pw.as_str());
+    // The vault file itself must be owner-only from creation: File::create
+    // would leave umask defaults (typically 0644) until a later chmod.
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&out)
+            .expect("create output file")
+    };
+    #[cfg(not(unix))]
     let mut f = File::create(&out).expect("create output file");
     db.save(&mut f, key).expect("save database");
     println!("created empty KDBX4 vault at {out}");

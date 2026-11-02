@@ -228,6 +228,8 @@ mod tests {
             deleted_date: trashed.then_some("2026-10-03T00:00:00Z".into()),
             item_type: 1,
             reprompt: None,
+            collection_ids: vec![],
+            attachments: vec![],
         }
     }
 

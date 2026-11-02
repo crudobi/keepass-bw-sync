@@ -210,6 +210,37 @@ impl Journal {
         Ok(n > 0)
     }
 
+    /// The recorded tombstone side for a KeePass UUID, if any. The side
+    /// distinguishes *why* an entry was binned: `"keepass"` (user-binned),
+    /// `"bitwarden"` (Bitwarden trash propagated into KeePass), and
+    /// `"bitwarden-absence"` (recycled on a twice-confirmed Bitwarden
+    /// listing absence — see `plan`'s missing-confirmation arm). The
+    /// deleted branch consults this before trashing: an absence-recycle
+    /// whose Bitwarden item reappeared must quarantine, never trash.
+    pub fn tombstone_side(&self, kp_uuid: &Uuid) -> Result<Option<String>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT side FROM tombstone WHERE kp_uuid = ?1")?;
+        let mut rows = st.query(params![kp_uuid.to_string()])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(r.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a tombstone row. Used only to clear a stale plan-time
+    /// `"bitwarden-absence"` record: when the entry is live and its
+    /// Bitwarden item is present again, the recycle never landed and the
+    /// record is stale evidence, not a completed delete.
+    pub fn clear_tombstone(&self, kp_uuid: &Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM tombstone WHERE kp_uuid = ?1",
+            params![kp_uuid.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Record a first sighting of a mapped Bitwarden item absent from a
     /// listing. A single absence may be a transient listing glitch, not a
     /// delete, so `plan()` only recycles after a second, independent

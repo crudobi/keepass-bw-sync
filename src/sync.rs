@@ -13,6 +13,14 @@
 //!   but `--force`/`--writeback` resolve them. Both sides holding identical
 //!   new content is agreement, not conflict: the journal watermark simply
 //!   refreshes (that is the post-crash recovery state).
+//!
+//! Naming notes (two lookalike pairs that have confused reviewers):
+//! - `adopt_bw_entry` (kdbx.rs) *creates* a new KeePass entry from a
+//!   Bitwarden item; `apply_bw_to_entry` *overwrites* an existing entry's
+//!   fields in place (the writeback path, which snapshots history first).
+//! - `BwClient::sync()` (bw.rs) is just the `POST /sync` cache refresh
+//!   against `bw serve`; the sync *engine* is this module (`plan`/`apply`).
+//!   Calling one does not run the other.
 
 use std::collections::{HashMap, HashSet};
 
@@ -44,7 +52,12 @@ pub enum Action {
     /// soft-delete the Bitwarden item (revision-guarded).
     TrashBw { bw_id: String, kp_uuid: Uuid, expected_revision: String },
     /// Bitwarden trashed the item and KeePass did not change it: recycle in KP.
-    RecycleKp { kp_uuid: Uuid, bw_id: String },
+    /// `from_absence` is true only for the missing-confirmation arm (the
+    /// item was absent from two independent listings, not seen trashed):
+    /// the apply arm records that reason in the tombstone side
+    /// (`"bitwarden-absence"`), so the deleted branch can tell an
+    /// absence-recycle whose item reappeared from a genuine user bin.
+    RecycleKp { kp_uuid: Uuid, bw_id: String, from_absence: bool },
     /// Unmapped, unstamped Bitwarden item: adopt as a new KeePass entry
     /// (only with --adopt), then stamp KBS_SYNC_ID back onto the BW item.
     AdoptBwNew { item_idx: usize },
@@ -93,13 +106,52 @@ fn top_group(group_path: &str) -> &str {
 
 /// Build the sync plan.
 ///
-/// Not pure: it performs idempotent journal writes for identity recovery
-/// (stamped-but-unmapped Bitwarden items get their mapping upserted) and
-/// terminal bookkeeping (both-sides-deleted pairs). All per-action journal
-/// mutations are deferred — [`apply`] returns them as [`JournalOp`]s and the
-/// caller commits them via [`Journal::apply_ops`] only after the KeePass
-/// database is durably saved, so the journal can never claim KeePass
-/// mutations that never reached disk.
+/// Not pure — and deliberately so (see the purity note below). `plan()`
+/// performs these journal writes *immediately*, in this order:
+/// - `clear_missing` for every item present in this listing (a reappearance
+///   means the earlier absence was a glitch, so the two-listing clock
+///   resets);
+/// - mapping rebuild: stamped-but-unmapped Bitwarden items whose UUID
+///   matches a KeePass entry, tombstone, or journal tombstone get their
+///   mapping upserted (baseline = the `KBS_SYNC_HASH` stamp, falling back
+///   to the live hash only for pre-stamp-hash items);
+/// - watermark refresh: a pair whose two sides agree on new content gets
+///   its mapping upserted to the common hash (post-crash agreement);
+/// - `missing_bw` bookkeeping: a first sighting of a mapped item absent
+///   from the listing is recorded (`note_missing`); a second, independent
+///   listing confirming the absence clears the record (`clear_missing`)
+///   and plans the recycle;
+/// - absence-recycle reason: when the missing-confirmation arm plans a
+///   recycle, the tombstone is recorded *at plan time* with side
+///   `"bitwarden-absence"` (distinguishable from a user bin, side
+///   `"keepass"`), so a crash between vault save and journal commit
+///   cannot turn the reappeared item's next run into a `TrashBw`;
+/// - terminal bookkeeping: both-sides-deleted pairs and already-trashed
+///   Bitwarden items complete immediately (`record_tombstone` +
+///   `delete_mapping_by_kp`).
+///
+/// Purity note (2026-11-01 review, refactor deliberately NOT taken): a
+/// pure move — plan returns its journal writes as a delta for the caller
+/// to apply — was stopped, not attempted halfway. Later reads inside
+/// `plan()` observe its own earlier writes (the rebuild upsert feeds the
+/// pair classification; `clear_missing`/`note_missing` drive the
+/// two-listing clock; terminal tombstones feed the tombstone-loop skip),
+/// so a delta without an in-plan overlay would change planned actions,
+/// and the only semantics-preserving shape (caller applies the delta
+/// immediately after plan) still needs that overlay plus new `JournalOp`
+/// variants for the `missing_bw`/tombstone bookkeeping — a second source
+/// of journal truth for zero behavior change. Deferring the delta to the
+/// post-save commit instead would change crash semantics (a run that
+/// bails mid-apply would lose first-sighting missing notes and
+/// stamp-rebuild mappings). Behavior is therefore kept, and this
+/// inventory is the contract.
+///
+/// All *per-action* journal mutations are still deferred — [`apply`]
+/// returns them as [`JournalOp`]s and the caller commits them via
+/// [`Journal::apply_ops`] only after the KeePass database is durably
+/// saved, so the journal can never claim KeePass mutations that never
+/// reached disk. Quarantine rows are per-action too: `plan()` only
+/// returns `Quarantine` actions, it never writes quarantine rows itself.
 pub fn plan(
     kp_entries: &[CanonicalEntry],
     kp_tombstones: &HashSet<Uuid>,
@@ -163,6 +215,39 @@ pub fn plan(
         journal.clear_missing(&it.id)?;
     }
 
+    // Fail-closed gates that fire BEFORE any other action for the item,
+    // in default mode and under --writeback/--force alike (those flags
+    // resolve conflicts; they never override a do-not-touch): org-owned
+    // items (non-empty `collectionIds`) and items with attachments. Each
+    // blocked item gets exactly one quarantine here; every later loop
+    // skips blocked ids, so the engine never creates, edits, stamps, or
+    // trashes one.
+    let mut blocked_bw: HashSet<&str> = HashSet::new();
+    for it in bw_items {
+        if it.org_owned() {
+            blocked_bw.insert(it.id.as_str());
+            actions.push(Action::Quarantine(QuarantineCase {
+                kind: "org-item",
+                kp_uuid: stamp_uuid(it),
+                bw_id: Some(it.id.clone()),
+                title: it.name.clone(),
+                detail: format!(
+                    "Bitwarden item {:?} is owned by an organization (collections: {:?}); org items are not synced — skipped, no data changed",
+                    it.name, it.collection_ids
+                ),
+            }));
+        } else if it.has_attachments() {
+            blocked_bw.insert(it.id.as_str());
+            actions.push(Action::Quarantine(QuarantineCase {
+                kind: "has-attachments",
+                kp_uuid: stamp_uuid(it),
+                bw_id: Some(it.id.clone()),
+                title: it.name.clone(),
+                detail: "has attachments, which this engine does not sync — skipped, no data changed".into(),
+            }));
+        }
+    }
+
     // Rebuild journal mappings from stamps (identity lives in the custom
     // field, so any host can rebuild the map). A stamp whose UUID matches no
     // KeePass entry is an orphan — most likely an interrupted adopt whose
@@ -182,6 +267,9 @@ pub fn plan(
     // --writeback/--force still apply). Items stamped before KBS_SYNC_HASH
     // existed have no stamp hash; only those fall back to the live hash.
     for it in bw_items {
+        if blocked_bw.contains(it.id.as_str()) {
+            continue;
+        }
         if let Some(u) = stamp_uuid(it) {
             if journal.mapping_by_kp(&u)?.is_none() {
                 let kp_has = kp_by_uuid.contains_key(&u)
@@ -208,11 +296,40 @@ pub fn plan(
     }
 
     for (idx, e) in kp_entries.iter().enumerate() {
+        // KeePass-side attachments quarantine before anything else for
+        // this entry — no CreateBw, UpdateBw, TrashBw, or WritebackEdit.
+        // When the mapped Bitwarden item is itself blocked (org/attached),
+        // its early quarantine already covers the pair: stay silent here
+        // so the pair reports exactly one quarantine, not two.
+        if e.has_attachments {
+            let mapped_id = journal
+                .mapping_by_kp(&e.uuid)?
+                .map(|(bw_id, _)| bw_id);
+            let mapped_blocked = mapped_id
+                .as_deref()
+                .map(|id| blocked_bw.contains(id))
+                .unwrap_or(false);
+            if !mapped_blocked {
+                actions.push(Action::Quarantine(QuarantineCase {
+                    kind: "has-attachments",
+                    kp_uuid: Some(e.uuid),
+                    bw_id: mapped_id,
+                    title: e.title.clone(),
+                    detail: "has attachments, which this engine does not sync — skipped, no data changed".into(),
+                }));
+            }
+            continue;
+        }
         if e.deleted {
             // In KeePass recycle bin: propagate a soft delete to BW when BW is
             // unchanged since last sync; otherwise it's a delete-vs-edit race.
             if let Some((bw_id, last_hash)) = journal.mapping_by_kp(&e.uuid)? {
                 if let Some(&bi) = bw_by_id.get(bw_id.as_str()) {
+                    // Blocked (org/attached) items never trash: the early
+                    // quarantine already covers this pair.
+                    if blocked_bw.contains(bw_id.as_str()) {
+                        continue;
+                    }
                     let it = &bw_items[bi];
                     if it.trashed() {
                         // Already trashed on both sides: nothing to
@@ -225,11 +342,32 @@ pub fn plan(
                         continue;
                     }
                     if it.content_hash_hex() == last_hash {
-                        actions.push(Action::TrashBw {
-                            bw_id,
-                            kp_uuid: e.uuid,
-                            expected_revision: it.revision_date.clone(),
-                        });
+                        // Absence-recycle window: this entry was binned
+                        // because two listings confirmed its Bitwarden
+                        // item absent, but the item has reappeared
+                        // unchanged (vault saved, journal commit lost).
+                        // Trashing it now would delete a live item on
+                        // both sides on the strength of stale absence
+                        // evidence — quarantine for human review instead.
+                        // A genuine user bin carries no absence tombstone
+                        // and still trashes in one run.
+                        if journal.tombstone_side(&e.uuid)?.as_deref()
+                            == Some("bitwarden-absence")
+                        {
+                            actions.push(Action::Quarantine(QuarantineCase {
+                                kind: "absence-recycle-reappeared",
+                                kp_uuid: Some(e.uuid),
+                                bw_id: Some(bw_id),
+                                title: e.title.clone(),
+                                detail: "entry was recycled after a confirmed Bitwarden listing absence, but the Bitwarden item reappeared unchanged; refusing to trash a live item on stale absence evidence".into(),
+                            }));
+                        } else {
+                            actions.push(Action::TrashBw {
+                                bw_id,
+                                kp_uuid: e.uuid,
+                                expected_revision: it.revision_date.clone(),
+                            });
+                        }
                     } else {
                         actions.push(Action::Quarantine(QuarantineCase {
                             kind: "delete-vs-edit",
@@ -251,10 +389,18 @@ pub fn plan(
             }
             Some((bw_id, last_hash)) => match bw_by_id.get(bw_id.as_str()) {
                 None => {
-                    // Mapped BW item is gone. Tombstoned = already handled.
-                    // Otherwise the user permanently deleted it in Bitwarden:
-                    // move the KP entry to the recycle bin (recoverable).
-                    if journal.tombstoned(&e.uuid)? {
+                    // Mapped BW item is gone. Tombstoned = already handled
+                    // — EXCEPT a plan-time "bitwarden-absence" record,
+                    // which means a recycle was planned but its apply
+                    // never committed (crash window): the two-listing
+                    // clock must re-run, not stall forever on
+                    // uncommitted evidence. Otherwise the user
+                    // permanently deleted it in Bitwarden: move the KP
+                    // entry to the recycle bin (recoverable).
+                    if journal.tombstoned(&e.uuid)?
+                        && journal.tombstone_side(&e.uuid)?.as_deref()
+                            != Some("bitwarden-absence")
+                    {
                         continue;
                     }
                     if kp_tombstones.contains(&e.uuid) {
@@ -288,14 +434,45 @@ pub fn plan(
                                 detail: "item is absent from the Bitwarden listing but the KeePass entry changed since last sync".into(),
                             }));
                         } else {
-                            actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                            // Record the reason durably NOW, at plan
+                            // time: if apply crashes after the vault
+                            // save but before the journal commit, the
+                            // next run's deleted branch sees this side
+                            // and quarantines instead of trashing the
+                            // reappeared item.
+                            journal.record_tombstone(
+                                &e.uuid,
+                                Some(&bw_id),
+                                "bitwarden-absence",
+                            )?;
+                            actions.push(Action::RecycleKp {
+                                kp_uuid: e.uuid,
+                                bw_id: bw_id.clone(),
+                                from_absence: true,
+                            });
                         }
                     } else {
                         journal.note_missing(&bw_id, &e.uuid)?;
                     }
                 }
                 Some(&bi) => {
+                    // Blocked items never reach pair handling: the early
+                    // quarantine is the only action for them.
+                    if blocked_bw.contains(bw_id.as_str()) {
+                        continue;
+                    }
                     let it = &bw_items[bi];
+                    // Stale plan-time absence record: the entry is live
+                    // and its item is present, so the planned recycle
+                    // never landed (crash before save) — clear the record
+                    // so it stops shadowing this mapping. (A committed
+                    // recycle deletes the mapping, so this arm can only
+                    // ever see a plan-time record.)
+                    if journal.tombstone_side(&e.uuid)?.as_deref()
+                        == Some("bitwarden-absence")
+                    {
+                        journal.clear_tombstone(&e.uuid)?;
+                    }
                     let h_kp = e.content_hash_hex();
                     let h_bw = it.content_hash_hex();
                     let kp_changed = h_kp != last_hash;
@@ -303,7 +480,11 @@ pub fn plan(
 
                     if it.trashed() {
                         if !kp_changed {
-                            actions.push(Action::RecycleKp { kp_uuid: e.uuid, bw_id: bw_id.clone() });
+                            actions.push(Action::RecycleKp {
+                                kp_uuid: e.uuid,
+                                bw_id: bw_id.clone(),
+                                from_absence: false,
+                            });
                         } else {
                             actions.push(Action::Quarantine(QuarantineCase {
                                 kind: "delete-vs-edit",
@@ -412,6 +593,10 @@ pub fn plan(
             continue;
         }
         if let Some((bw_id, _)) = journal.mapping_by_kp(u)? {
+            // Blocked items never trash, even from the tombstone arm.
+            if blocked_bw.contains(bw_id.as_str()) {
+                continue;
+            }
             match bw_by_id.get(bw_id.as_str()) {
                 Some(&bi) if !bw_items[bi].trashed() => {
                     actions.push(Action::TrashBw {
@@ -442,6 +627,10 @@ pub fn plan(
     // model, and silently reshaping a secure note into a login-shaped entry
     // would corrupt the user's data. Other types quarantine for human review.
     for (idx, it) in bw_items.iter().enumerate() {
+        // Already quarantined by the early gate; never adopt or re-report.
+        if blocked_bw.contains(it.id.as_str()) {
+            continue;
+        }
         if it.trashed() || stamp_uuid(it).is_some() {
             continue;
         }
@@ -609,7 +798,7 @@ pub fn apply(
                     }
                 }
             }
-            Action::RecycleKp { kp_uuid, bw_id } => {
+            Action::RecycleKp { kp_uuid, bw_id, from_absence } => {
                 eprintln!(
                     "warning: Bitwarden item {bw_id} missing from listing; moving KeePass entry to recycle bin (recoverable)"
                 );
@@ -617,7 +806,11 @@ pub fn apply(
                     journal_ops.push(JournalOp::RecordTombstone {
                         kp_uuid: *kp_uuid,
                         bw_id: Some(bw_id.clone()),
-                        side: "bitwarden",
+                        side: if *from_absence {
+                            "bitwarden-absence"
+                        } else {
+                            "bitwarden"
+                        },
                     });
                     journal_ops.push(JournalOp::DeleteMappingByKp { kp_uuid: *kp_uuid });
                     report.kp_recycled += 1;
@@ -686,6 +879,7 @@ mod tests {
             custom: vec![],
             group_path: "".into(),
             deleted: false,
+            has_attachments: false,
         }
     }
 
@@ -720,6 +914,8 @@ mod tests {
             deleted_date: None,
             item_type: 1,
             reprompt: None,
+            collection_ids: vec![],
+            attachments: vec![],
         }
     }
 
@@ -1379,5 +1575,286 @@ mod tests {
         let entries = crate::kdbx::extract_entries(&vault.db);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].group_path, "Ops");
+    }
+
+    fn org_item(id: &str, kp_uuid: Option<&str>, rev: &str) -> BwItem {
+        let mut it = bw_item(id, kp_uuid, rev);
+        it.collection_ids = vec!["coll-1".into()];
+        it
+    }
+
+    fn attached_item(id: &str, kp_uuid: Option<&str>, rev: &str) -> BwItem {
+        let mut it = bw_item(id, kp_uuid, rev);
+        it.attachments = vec![crate::bw::BwAttachment {
+            id: Some("att-1".into()),
+            file_name: Some("scan.pdf".into()),
+            size: Some(1234),
+        }];
+        it
+    }
+
+    /// Any action that would write to Bitwarden (or bin in KeePass) for
+    /// the given item id. Quarantines are the only permitted action.
+    fn writes_for(actions: &[Action], bw_id: &str) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CreateBw { .. } => None,
+                Action::UpdateBw { bw_id: id, .. } if id == bw_id => Some("UpdateBw"),
+                Action::TrashBw { bw_id: id, .. } if id == bw_id => Some("TrashBw"),
+                Action::RecycleKp { bw_id: id, .. } if id == bw_id => Some("RecycleKp"),
+                Action::AdoptBwNew { .. } => None,
+                Action::WritebackEdit { bw_id: id, .. } if id == bw_id => {
+                    Some("WritebackEdit")
+                }
+                _ => None,
+            })
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn org_item_quarantines_once_and_personal_item_still_syncs() {
+        // An org-owned item in a listing gets exactly one org quarantine
+        // and zero BW writes for it; a personal item in the same listing
+        // still plans its create. The flags must not override this:
+        // --writeback/--force resolve conflicts, never a do-not-touch.
+        for opts in [
+            SyncOpts::default(),
+            SyncOpts { writeback: true, ..Default::default() },
+            SyncOpts { force: true, ..Default::default() },
+        ] {
+            let j = test_journal();
+            let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+            let org = org_item("bw-org", None, "r1");
+            let listed = vec![org];
+            let p = plan(&kp, &HashSet::new(), &listed, &[], &j, &opts).unwrap();
+            let org_q: Vec<&Action> = p
+                .actions
+                .iter()
+                .filter(|a| {
+                    matches!(a, Action::Quarantine(q) if q.kind == "org-item")
+                })
+                .collect();
+            assert_eq!(
+                org_q.len(),
+                1,
+                "expected exactly one org quarantine, got {}",
+                org_q.len()
+            );
+            if let Action::Quarantine(q) = org_q[0] {
+                assert!(q.detail.contains("org items are not synced"), "detail: {}", q.detail);
+                assert_eq!(q.bw_id.as_deref(), Some("bw-org"));
+            }
+            assert!(
+                writes_for(&p.actions, "bw-org").is_empty(),
+                "org item must have zero BW writes, got {:?}", p.actions
+            );
+            // The personal KeePass entry still plans its create.
+            assert!(
+                p.actions.iter().any(|a| matches!(a, Action::CreateBw { .. })),
+                "personal entry must still sync, got {:?}", p.actions
+            );
+        }
+    }
+
+    #[test]
+    fn org_item_blocks_update_and_trash() {
+        // A mapped org item must not be edited even when KeePass changed,
+        // and a binned KeePass entry mapped to an org item must not trash
+        // it — both quarantine instead, under every flag combination.
+        for opts in [
+            SyncOpts::default(),
+            SyncOpts { writeback: true, ..Default::default() },
+            SyncOpts { force: true, ..Default::default() },
+        ] {
+            // Changed KP entry, mapped org item: quarantine, no UpdateBw.
+            let j = test_journal();
+            let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+            let mut org = org_item("bw-org", Some("11111111-1111-1111-1111-111111111111"), "r1");
+            j.upsert_mapping(&kp[0].uuid, "bw-org", &org.content_hash_hex()).unwrap();
+            kp[0].title = "edited locally".into();
+            let p = plan(&kp, &HashSet::new(), &[org.clone()], &[], &j, &opts).unwrap();
+            assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+            assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "org-item"));
+            assert!(writes_for(&p.actions, "bw-org").is_empty());
+
+            // Binned KP entry, mapped org item: quarantine, no TrashBw.
+            let j = test_journal();
+            let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+            kp[0].deleted = true;
+            org.fields.iter_mut().find(|f| f.name == crate::stamps::SYNC_HASH_FIELD).unwrap().value =
+                org.content_hash_hex();
+            j.upsert_mapping(&kp[0].uuid, "bw-org", &org.content_hash_hex()).unwrap();
+            let p = plan(&kp, &HashSet::new(), &[org], &[], &j, &opts).unwrap();
+            assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+            assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "org-item"));
+            assert!(writes_for(&p.actions, "bw-org").is_empty());
+        }
+    }
+
+    #[test]
+    fn bw_item_with_attachments_quarantines_and_is_never_adopted() {
+        // BW-side attachments: unmapped item quarantines (never adopted,
+        // even with --adopt), and a mapped item never updates.
+        let j = test_journal();
+        let attached = attached_item("bw-att", None, "r1");
+        let opts = SyncOpts { adopt: true, ..Default::default() };
+        let p = plan(&[], &HashSet::new(), &[attached], &[], &j, &opts).unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(
+            matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "has-attachments" && q.detail.contains("has attachments, which this engine does not sync")),
+            "got {:?}", p.actions[0]
+        );
+
+        let j = test_journal();
+        let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let attached = attached_item("bw-att", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        j.upsert_mapping(&kp[0].uuid, "bw-att", &attached.content_hash_hex()).unwrap();
+        kp[0].title = "edited locally".into();
+        let p = plan(&kp, &HashSet::new(), &[attached], &[], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "has-attachments"));
+        assert!(writes_for(&p.actions, "bw-att").is_empty());
+    }
+
+    #[test]
+    fn kp_entry_with_attachments_quarantines_instead_of_syncing() {
+        // KeePass-side attachments: a new entry never creates, a changed
+        // mapped entry never updates, and a binned entry never trashes.
+        // Each case plans exactly one has-attachments quarantine whose
+        // detail states the engine does not sync attachments.
+        let assert_quarantine_only = |p: Plan| {
+            assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+            assert!(
+                matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "has-attachments" && q.detail == "has attachments, which this engine does not sync — skipped, no data changed"),
+                "got {:?}", p.actions[0]
+            );
+        };
+        // New entry with attachments: no CreateBw.
+        let mut e = entry("11111111-1111-1111-1111-111111111111");
+        e.has_attachments = true;
+        let j = test_journal();
+        let p = plan(&[e], &HashSet::new(), &[], &[], &j, &SyncOpts::default()).unwrap();
+        assert_quarantine_only(p);
+        // Changed mapped entry with attachments: no UpdateBw.
+        let j = test_journal();
+        let mut e = entry("11111111-1111-1111-1111-111111111111");
+        e.has_attachments = true;
+        e.title = "edited locally".into();
+        let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        j.upsert_mapping(&e.uuid, "bw-1", &bi.content_hash_hex()).unwrap();
+        let p = plan(&[e], &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert_quarantine_only(p);
+        // Binned entry with attachments: no TrashBw.
+        let j = test_journal();
+        let mut e = entry("11111111-1111-1111-1111-111111111111");
+        e.has_attachments = true;
+        e.deleted = true;
+        let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        j.upsert_mapping(&e.uuid, "bw-1", &bi.content_hash_hex()).unwrap();
+        let p = plan(&[e], &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert_quarantine_only(p);
+    }
+
+    #[test]
+    fn absence_recycle_reappeared_quarantines_instead_of_trashing() {
+        // The double-bin window, simulated end to end at the plan/apply
+        // seam: (1) two listings confirm the absence and plan the
+        // recycle — the plan-time tombstone records the absence reason;
+        // (2) apply bins the KeePass entry and saves the vault, but the
+        // journal commit is LOST (crash: ops discarded); (3) the next
+        // run sees the binned entry and the reappeared, unchanged BW
+        // item — it must quarantine, never TrashBw, and the BW item
+        // stays intact (no trash action exists to apply).
+        let j = test_journal();
+        let mut kp = vec![];
+        let mut items = vec![];
+        for i in 1..=4u8 {
+            let (e, bi) = mapped_pair(&j, i);
+            kp.push(e);
+            items.push(bi);
+        }
+        // The pair under test is bw-4 / uuid ...1114.
+        let target_uuid: Uuid = "11111111-1111-1111-1111-111111111114".parse().unwrap();
+        let partial: Vec<BwItem> = items[..3].to_vec();
+        let p = plan(&kp, &HashSet::new(), &partial, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "first sighting must not recycle");
+        let p = plan(&kp, &HashSet::new(), &partial, &[], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(
+            matches!(&p.actions[0], Action::RecycleKp { from_absence: true, .. }),
+            "expected an absence recycle, got {:?}", p.actions[0]
+        );
+        assert_eq!(
+            j.tombstone_side(&target_uuid).unwrap().as_deref(),
+            Some("bitwarden-absence"),
+            "plan must record the absence reason durably"
+        );
+        // Apply bins the entry (in-memory vault with a real recycle bin)
+        // — then the journal commit is lost: ops are discarded, exactly
+        // the crash window.
+        let mut vault = crate::kdbx::test_vault();
+        {
+            use keepass::db::fields;
+            let mut root = vault.db.root_mut();
+            let mut e = root
+                .add_entry_with_id(keepass::db::EntryId::from_uuid(target_uuid))
+                .unwrap();
+            e.set_unprotected(fields::TITLE, "t");
+            e.set_protected(fields::USERNAME, "u");
+            e.set_protected(fields::PASSWORD, "p");
+        }
+        let bin_uuid = {
+            let mut root = vault.db.root_mut();
+            let mut bin = root.add_group();
+            bin.name = "Recycle Bin".to_string();
+            bin.id().uuid()
+        };
+        vault.db.meta.recyclebin_uuid = Some(bin_uuid);
+        let bw = BwClient::new("http://127.0.0.1:1").unwrap();
+        let (report, _discarded_ops) =
+            apply(&p, &kp, &items, &bw, &mut vault, &[]).unwrap();
+        assert_eq!(report.kp_recycled, 1);
+        assert!(
+            j.mapping_by_kp(&target_uuid).unwrap().is_some(),
+            "crash: the mapping must still be there (commit lost)"
+        );
+        // Next run: the entry is binned, the BW item reappeared unchanged.
+        let mut entries = crate::kdbx::extract_entries(&vault.db);
+        // The vault holds only the target entry; re-add the other three
+        // live entries so the listing guards (majority-present) pass.
+        entries.extend(kp.into_iter().filter(|e| e.uuid != target_uuid));
+        let binned = entries.iter().find(|e| e.uuid == target_uuid).unwrap();
+        assert!(binned.deleted, "applied recycle must have binned the entry");
+        let p = plan(&entries, &HashSet::new(), &items, &[], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            p.actions.iter().all(|a| !matches!(a, Action::TrashBw { .. })),
+            "no TrashBw may fire on a reappeared item, got {:?}", p.actions
+        );
+        assert!(
+            p.actions.iter().any(|a| matches!(a, Action::Quarantine(q) if q.kind == "absence-recycle-reappeared")),
+            "expected an absence-recycle-reappeared quarantine, got {:?}", p.actions
+        );
+    }
+
+    #[test]
+    fn user_binned_entry_still_trashes_in_one_run() {
+        // Positive control for the absence guard: a genuine user bin
+        // (no absence tombstone) still plans TrashBw immediately, with
+        // no quarantine in the way.
+        let j = test_journal();
+        let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        kp[0].deleted = true;
+        let bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &bi.content_hash_hex()).unwrap();
+        let p = plan(&kp, &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1, "got {:?}", p.actions);
+        assert!(matches!(&p.actions[0], Action::TrashBw { .. }));
+        assert_eq!(
+            j.tombstone_side(&kp[0].uuid).unwrap(),
+            None,
+            "a user bin must not carry an absence tombstone"
+        );
     }
 }

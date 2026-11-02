@@ -55,7 +55,7 @@ impl std::fmt::Debug for BwLogin {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BwField {
     pub name: String,
     pub value: String,
@@ -64,6 +64,45 @@ pub struct BwField {
     /// visible text field. Defaults to 0 for payloads that omit it.
     #[serde(rename = "type", default)]
     pub field_type: i32,
+}
+
+// Redacting Debug, matching `BwItem`/`BwLogin`: a field value can hold a
+// secret (API key, …), so it must never appear in a `{:?}` log line.
+impl std::fmt::Debug for BwField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwField")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("field_type", &self.field_type)
+            .finish()
+    }
+}
+
+/// Deserialize a field that may be present-but-null as its default: the
+/// serve payload omits empty arrays on some shapes and sends explicit
+/// `null` on others; both must read as "none", never fail the parse.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+/// One Bitwarden attachment descriptor, as the serve item payload exposes
+/// it: the `attachments` array on a cipher view (each entry carries `id`,
+/// `fileName`, `size`, …). Only presence is ever used by the engine —
+// this engine never downloads attachments — so the remaining fields stay
+/// optional and unknown shapes still parse.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BwAttachment {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(rename = "fileName", default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -90,6 +129,26 @@ pub struct BwItem {
     /// it is a policy flag, not content.
     #[serde(default)]
     pub reprompt: Option<i32>,
+    /// Organization collections this item belongs to, from the serve
+    /// payload's `collectionIds`. A non-empty list means the item is
+    /// org-owned: the engine never creates, edits, stamps, or trashes it
+    /// (see the `org-item` quarantine in `plan`). Parsed, not echoed:
+    /// engine PUTs are full replaces, so carrying no collections on an
+    /// org item would risk stripping its membership — quarantining
+    /// instead is what keeps that risk unreachable.
+    #[serde(
+        rename = "collectionIds",
+        default,
+        deserialize_with = "null_as_default"
+    )]
+    pub collection_ids: Vec<String>,
+    /// Attachment descriptors from the serve payload's `attachments`
+    /// array (present on the cipher view for both list and get). A
+    /// non-empty list means the item carries files this engine does not
+    /// sync: it quarantines (see `has-attachments` in `plan`) instead of
+    /// being edited, stamped, or trashed. `null`/absent parses as empty.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub attachments: Vec<BwAttachment>,
 }
 
 // Redacting Debug: custom-field values can hold secrets (API keys, …);
@@ -115,6 +174,11 @@ impl std::fmt::Debug for BwItem {
             .field("deleted_date", &self.deleted_date)
             .field("item_type", &self.item_type)
             .field("reprompt", &self.reprompt)
+            // Collection ids are not secrets, but only membership matters
+            // for debugging; attachment file names can be descriptive
+            // (e.g. a scan filename), so only the count is shown.
+            .field("collection_ids", &self.collection_ids)
+            .field("attachment_count", &self.attachments.len())
             .finish()
     }
 }
@@ -183,6 +247,17 @@ impl BwItem {
 
     pub fn trashed(&self) -> bool {
         self.deleted_date.is_some()
+    }
+
+    /// True when the serve payload lists this item in any organization
+    /// collection: the item is org-owned and the engine must not touch it.
+    pub fn org_owned(&self) -> bool {
+        !self.collection_ids.is_empty()
+    }
+
+    /// True when the serve payload lists attachments on this item.
+    pub fn has_attachments(&self) -> bool {
+        !self.attachments.is_empty()
     }
 }
 
@@ -349,10 +424,31 @@ impl BwClient {
         })
     }
 
+    /// Cap on a single response body, enforced inside `exchange_once`
+    /// only. This is the JSON-envelope path (listings, items, folders,
+    /// create/edit/delete replies): the largest legitimate payload is a
+    /// full vault listing, which is far below this on any realistic vault
+    /// (even a 10k-item vault serializes to a few MiB), so 32 MiB leaves
+    /// huge headroom while bounding what a compromised or malicious
+    /// `bw serve` can make the sync process allocate. Over-cap responses
+    /// fail closed with a clear error: no partial parse, and no retry
+    /// (a retry would re-fetch the same oversized body).
+    ///
+    /// Deliberately NOT a client-level or shared-fetch limit: a future
+    /// attachment-download path will stream raw bytes and can legitimately
+    /// run to tens of MB per blob. That path must bypass `exchange_once`
+    /// (its own streaming read), never inherit this JSON cap.
+    const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
     /// One HTTP exchange: send a freshly built request and return the raw
     /// (status, body). `send_ctx`/`parse_ctx` are the caller's original
     /// error contexts, so error strings are unchanged from the pre-retry
     /// code. Does not itself retry; see `exchange_retry`.
+    ///
+    /// The body is read through a bounded `take()`: at most cap + 1 bytes
+    /// are ever pulled off the wire, so an unbounded `Content-Length`
+    /// (or a chunked stream that never ends) cannot OOM the process
+    /// before the cap check fires.
     fn exchange_once<F>(
         &self,
         send_ctx: &str,
@@ -362,9 +458,19 @@ impl BwClient {
     where
         F: FnOnce() -> reqwest::blocking::RequestBuilder,
     {
+        use std::io::Read as _;
         let resp = build().send().with_context(|| send_ctx.to_string())?;
         let status = resp.status();
-        let bytes = resp.bytes().with_context(|| parse_ctx.to_string())?.to_vec();
+        let mut bytes = Vec::new();
+        resp.take((Self::MAX_RESPONSE_BODY_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| parse_ctx.to_string())?;
+        if bytes.len() > Self::MAX_RESPONSE_BODY_BYTES {
+            bail!(
+                "bw response body exceeds the {} MiB cap; refusing to parse an oversized response from bw serve",
+                Self::MAX_RESPONSE_BODY_BYTES / (1024 * 1024)
+            );
+        }
         Ok((status, bytes))
     }
 
@@ -822,6 +928,7 @@ pub(crate) mod tests {
             custom: vec![],
             group_path: "".into(),
             deleted: false,
+            has_attachments: false,
         }
     }
 
@@ -1238,5 +1345,69 @@ pub(crate) mod tests {
         let bw = BwClient::new(&base).unwrap();
         let out = bw.trash_item("bw-1", Some("r1")).unwrap();
         assert_eq!(out, TrashOutcome::Trashed);
+    }
+
+    #[test]
+    fn bw_field_debug_redacts_value() {
+        // BwField used to derive Debug, printing custom-field values
+        // (API keys, …) in cleartext. The manual impl must redact.
+        let f = BwField {
+            name: "API key".into(),
+            value: "super-secret-value".into(),
+            field_type: 1,
+        };
+        let dbg = format!("{f:?}");
+        assert!(!dbg.contains("super-secret-value"), "Debug leaked value: {dbg}");
+        assert!(dbg.contains("API key"), "Debug must still show the name");
+    }
+
+    #[test]
+    fn item_parses_collection_ids_and_attachments() {
+        // The serve cipher view carries org membership as `collectionIds`
+        // and file presence as `attachments` (each with `id`/`fileName`).
+        // Both must survive parsing: dropping them silently is what used
+        // to let engine PUTs risk stripping collection membership and
+        // let attachment content go unnoticed.
+        let item: BwItem = serde_json::from_value(serde_json::json!({
+            "id": "bw-org", "name": "org item", "notes": null, "favorite": false,
+            "folderId": null, "type": 1, "reprompt": 0,
+            "collectionIds": ["coll-1", "coll-2"],
+            "attachments": [{"id": "att-1", "fileName": "scan.pdf", "size": 1234}],
+            "login": null, "fields": [],
+            "revisionDate": "r1", "deletedDate": null
+        }))
+        .unwrap();
+        assert!(item.org_owned());
+        assert_eq!(item.collection_ids, vec!["coll-1", "coll-2"]);
+        assert!(item.has_attachments());
+        assert_eq!(item.attachments[0].file_name.as_deref(), Some("scan.pdf"));
+        // Absent/null fields parse as "personal, no attachments".
+        let plain: BwItem = serde_json::from_value(serde_json::json!({
+            "id": "bw-plain", "name": "plain", "notes": null, "favorite": false,
+            "folderId": null, "type": 1, "reprompt": 0,
+            "collectionIds": null, "attachments": null,
+            "login": null, "fields": [],
+            "revisionDate": "r1", "deletedDate": null
+        }))
+        .unwrap();
+        assert!(!plain.org_owned());
+        assert!(!plain.has_attachments());
+    }
+
+    #[test]
+    fn oversized_response_body_fails_closed() {
+        // A body over the 32 MiB cap must surface as an error, not a
+        // parse attempt — and the bounded take() in `exchange_once`
+        // means at most cap + 1 bytes are ever read off the wire, so a
+        // malicious serve cannot OOM the process with a huge body.
+        let huge = "x".repeat(33 * 1024 * 1024);
+        let base = stub_server(vec![("GET /list/object/items ".into(), 200, huge)]);
+        let bw = BwClient::new(&base).unwrap();
+        let err = bw.list_items().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("32 MiB"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -270,6 +270,14 @@ fn entry_to_canonical(db: &Database, w: &WalkedEntry) -> CanonicalEntry {
             )
         })
         .collect();
+    // Binary attachments live on the entry's attachment map, which the
+    // keepass crate keeps private on the cloned `Entry` — read presence
+    // off the live database handle instead (any attachment, whatever its
+    // name or size, counts: the engine syncs none of them).
+    let has_attachments = db
+        .entry(w.id)
+        .map(|e| e.attachments().next().is_some())
+        .unwrap_or(false);
     CanonicalEntry {
         uuid: w.id.uuid(),
         title: entry.get_title().unwrap_or_default().to_string(),
@@ -282,6 +290,7 @@ fn entry_to_canonical(db: &Database, w: &WalkedEntry) -> CanonicalEntry {
         custom,
         group_path: w.group_path.clone(),
         deleted,
+        has_attachments,
     }
 }
 
@@ -299,10 +308,18 @@ pub fn tombstoned_uuids(db: &Database) -> HashSet<Uuid> {
 /// Crash-safe save: write temp file, fsync, atomic rename, fsync parent dir.
 ///
 /// The rename replaces the vault file, so the temp file's permissions are
-/// what the vault ends up with: `File::create` would give it umask
-/// defaults (typically 0644) and silently relax an owner-only vault. The
-/// existing vault's mode is therefore applied to the temp file before the
-/// rename; a brand-new vault starts 0600.
+/// what the vault ends up with: a umask-default temp (typically 0644)
+/// would silently relax an owner-only vault. The existing vault's mode is
+/// therefore applied to the temp file at creation; a brand-new vault
+/// starts 0600.
+///
+/// The temp path is opened `O_EXCL` (`create_new`), never `File::create`
+/// (which follows symlinks): a symlink planted at the tmp path can never
+/// redirect the encrypted vault write. A stale tmp from a crashed run is
+/// the one exception — a *regular* file there is cleared and retried —
+/// but a symlink is refused outright, and the retry still uses
+/// `create_new`, so a link re-planted in the gap fails closed too
+/// instead of being followed.
 pub fn save_vault(v: &KdbxVault) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -313,10 +330,37 @@ pub fn save_vault(v: &KdbxVault) -> Result<()> {
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600);
     {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-            .context("chmod tmp vault")?;
+        let open_tmp = || {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(mode);
+            }
+            opts.open(&tmp)
+        };
+        let mut f = match open_tmp() {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let md = std::fs::symlink_metadata(&tmp)
+                    .with_context(|| format!("stat tmp {}", tmp.display()))?;
+                if md.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "refusing to save vault: temp path {} is a symlink; refusing to follow it",
+                        tmp.display()
+                    );
+                }
+                // Stale regular tmp from a crashed run: clear and retry
+                // (still O_EXCL, so a race re-plant fails closed).
+                std::fs::remove_file(&tmp)
+                    .with_context(|| format!("clear stale tmp {}", tmp.display()))?;
+                open_tmp().with_context(|| format!("create {}", tmp.display()))?
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("create {}", tmp.display()));
+            }
+        };
         v.db.save(&mut f, key).context("serialize .kdbx")?;
         f.sync_all().context("fsync tmp")?;
     }
@@ -976,6 +1020,8 @@ mod tests {
             deleted_date: None,
             item_type: 1,
             reprompt: None,
+            collection_ids: vec![],
+            attachments: vec![],
         };
         {
             let mut e = db.entry_mut(id).unwrap();
@@ -1017,6 +1063,8 @@ mod tests {
             deleted_date: None,
             item_type: 1,
             reprompt: None,
+            collection_ids: vec![],
+            attachments: vec![],
         }
     }
 
@@ -1132,6 +1180,42 @@ mod tests {
         save_vault(&v2).unwrap();
         let mode = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "fresh vault must be 0600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_vault_refuses_planted_tmp_symlink() {
+        // A symlink planted at `<vault>.kdbx.tmp` must never redirect the
+        // encrypted vault write: the save fails closed and the link's
+        // target is untouched. A stale *regular* tmp file (crashed run)
+        // still saves fine — the unlink clears it first.
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("kbs-save-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault.kdbx");
+        let target = dir.join("victim.txt");
+        std::fs::write(&target, b"do not touch").unwrap();
+        let tmp = path.with_extension("kdbx.tmp");
+        symlink(&target, &tmp).unwrap();
+        let mut v = test_vault();
+        v.password = Secret::from_str("pw");
+        v.path = path.clone();
+        assert!(
+            save_vault(&v).is_err(),
+            "save through a planted tmp symlink must fail closed"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"do not touch",
+            "symlink target must be untouched"
+        );
+        assert!(!path.exists(), "no vault may appear from a refused save");
+        // Recovery: link gone, a stale regular tmp saves fine.
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"stale junk").unwrap();
+        save_vault(&v).unwrap();
+        assert!(path.exists(), "save must succeed once the tmp path is clean");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

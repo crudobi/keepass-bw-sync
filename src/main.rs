@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use keepass_bw_sync::bw::BwClient;
+use keepass_bw_sync::bw::{BwClient, BwItem};
+use keepass_bw_sync::canonical::CanonicalEntry;
 use keepass_bw_sync::journal::Journal;
 use keepass_bw_sync::kdbx::{
     display_path, extract_entries, get_entry_field, list_entries, new_vault, open_vault, put_entry,
@@ -11,7 +12,7 @@ use keepass_bw_sync::kdbx::{
 };
 use keepass_bw_sync::restore::{check_target_empty, restore_into};
 use keepass_bw_sync::secret::Secret;
-use keepass_bw_sync::sync::{apply, plan, SyncOpts};
+use keepass_bw_sync::sync::{apply, plan, Action, SyncOpts};
 
 #[derive(Parser)]
 #[command(name = "keepass-bw-sync", about = "Bidirectional KeePass2 <-> Bitwarden sync engine")]
@@ -45,6 +46,11 @@ enum Cmd {
         /// Create KeePass entries for unmapped Bitwarden items.
         #[arg(long)]
         adopt: bool,
+        /// Preview only: print the planned actions and exit without
+        /// applying anything and without mutating the journal or the
+        /// vault. Sync-only: other subcommands reject this flag.
+        #[arg(long)]
+        dry_run: bool,
         /// Allow a non-loopback bw serve URL. The transport is plaintext
         /// HTTP with no auth: a remote URL exfiltrates vault secrets.
         #[arg(long)]
@@ -262,6 +268,54 @@ fn master_password() -> Result<Secret> {
     Ok(Secret::from_str(pw.as_str()))
 }
 
+/// One human-readable line per planned action: kind + title + ids.
+/// Titles resolve from the plan's own inputs; a TrashBw planned from a
+/// KeePass tombstone (no live entry) falls back to the Bitwarden id.
+fn describe_action(a: &Action, entries: &[CanonicalEntry], items: &[BwItem]) -> String {
+    let entry_title = |uuid: &uuid::Uuid| {
+        entries
+            .iter()
+            .find(|e| &e.uuid == uuid)
+            .map(|e| e.title.clone())
+    };
+    match a {
+        Action::CreateBw { entry_idx } => {
+            let e = &entries[*entry_idx];
+            format!("CreateBw title={:?} kp={}", e.title, e.uuid)
+        }
+        Action::UpdateBw { bw_id, entry_idx, .. } => {
+            let e = &entries[*entry_idx];
+            format!("UpdateBw title={:?} bw={bw_id} kp={}", e.title, e.uuid)
+        }
+        Action::TrashBw { bw_id, kp_uuid, .. } => {
+            let title = entry_title(kp_uuid).unwrap_or_else(|| bw_id.clone());
+            format!("TrashBw title={title:?} bw={bw_id} kp={kp_uuid}")
+        }
+        Action::RecycleKp { kp_uuid, bw_id, .. } => {
+            let title = entry_title(kp_uuid).unwrap_or_else(|| bw_id.clone());
+            format!("RecycleKp title={title:?} bw={bw_id} kp={kp_uuid}")
+        }
+        Action::AdoptBwNew { item_idx } => {
+            let it = &items[*item_idx];
+            format!("AdoptBwNew title={:?} bw={}", it.name, it.id)
+        }
+        Action::WritebackEdit { bw_id, kp_uuid, item_idx } => {
+            let title = items
+                .get(*item_idx)
+                .map(|it| it.name.clone())
+                .or_else(|| entry_title(kp_uuid))
+                .unwrap_or_else(|| bw_id.clone());
+            format!("WritebackEdit title={title:?} bw={bw_id} kp={kp_uuid}")
+        }
+        Action::Quarantine(q) => {
+            format!(
+                "Quarantine kind={} title={:?} kp={:?} bw={:?}",
+                q.kind, q.title, q.kp_uuid, q.bw_id
+            )
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -273,6 +327,7 @@ fn main() -> Result<()> {
             writeback,
             force,
             adopt,
+            dry_run,
             insecure_remote_url,
         } => {
             let _lock = acquire_journal_lock(&journal)?;
@@ -297,7 +352,25 @@ fn main() -> Result<()> {
             // Fail closed: a transient folder-list failure must not silently
             // duplicate server folders (the CreateBw path creates them).
             let folders = bw.list_folders().context("list bitwarden folders")?;
-            let journal = Journal::open(&journal)?;
+            // Dry run: plan against a throwaway copy of the journal, so
+            // plan()'s immediate bookkeeping (mapping rebuild, missing
+            // notes, watermark refresh) can never touch the real journal.
+            // The vault is never saved and apply() never runs, so the
+            // vault bytes are untouched too. (The journal lock is still
+            // held, and `bw.sync()` still refreshes serve's cache — a
+            // download-only refresh, not a vault or journal mutation.)
+            let tmp_journal: Option<PathBuf> = if dry_run {
+                let p = std::env::temp_dir()
+                    .join(format!("kbs-dry-run-{}.db", std::process::id()));
+                if journal.exists() {
+                    std::fs::copy(&journal, &p).context("copy journal for dry run")?;
+                }
+                Some(p)
+            } else {
+                None
+            };
+            let journal_path = tmp_journal.as_ref().unwrap_or(&journal);
+            let journal = Journal::open(journal_path)?;
 
             let plan = plan(&entries, &tombstones, &items, &folders, &journal, &opts)?;
             println!(
@@ -306,6 +379,19 @@ fn main() -> Result<()> {
                 entries.len(),
                 items.len()
             );
+            if dry_run {
+                for a in &plan.actions {
+                    println!("  {}", describe_action(a, &entries, &items));
+                }
+                println!(
+                    "dry run: {} actions, no changes made (journal and vault untouched)",
+                    plan.actions.len()
+                );
+                if let Some(p) = &tmp_journal {
+                    let _ = std::fs::remove_file(p);
+                }
+                return Ok(());
+            }
             let (report, journal_ops) =
                 apply(&plan, &entries, &items, &bw, &mut vault, &folders)?;
             println!(
