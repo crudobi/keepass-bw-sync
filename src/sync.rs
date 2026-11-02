@@ -271,6 +271,69 @@ pub fn plan(
         );
     }
 
+    // Partial-folder-listing guard: the empty-list guard above covers
+    // only total failure. A truncated non-empty listing still passes
+    // it, and `folder_for` (apply) would then create duplicate
+    // same-named folders for any placement decision made against the
+    // truncated list. Bail when a non-blocked, non-trashed item
+    // references a folder id absent from the listing AND its mapped
+    // live pair would carry a folderId: an agreeing pair whose top
+    // group differs from the (unknown) folder name plans a move, a
+    // KeePass-only change plans an UpdateBw, and --force plans one for
+    // any divergence. Adopt-path items (no mapping) use the root-group
+    // fallback and create no folder, so they never trip; trashed items
+    // recycle or quarantine without placement, so neither do they; and
+    // root-group pairs resolve to no folder either way.
+    {
+        let known_folder_ids: HashSet<&str> = folders.iter().map(|f| f.id.as_str()).collect();
+        for it in bw_items {
+            // The gates loop below has not run yet (it must stay after
+            // reconcile/clear_missing, so a refused sync changes
+            // nothing), so the blocked check is mirrored inline here
+            // instead of reading `blocked_bw`: org-owned, attached,
+            // TOTP-source-named, or duplicate-named. Keep in sync with
+            // the gates loop.
+            let gate_blocked = it.org_owned()
+                || it.has_attachments()
+                || it
+                    .fields
+                    .iter()
+                    .any(|f| crate::kdbx::is_totp_source_field(&f.name))
+                || duplicate_field_name(it).is_some();
+            if gate_blocked || it.trashed() {
+                continue;
+            }
+            let Some(fid) = it.folder_id.as_deref().filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            if known_folder_ids.contains(fid) {
+                continue;
+            }
+            let Some((kp_uuid, last_hash)) = journal.mapping_by_bw(&it.id)? else {
+                continue;
+            };
+            let Some(&ei) = kp_by_uuid.get(&kp_uuid) else {
+                continue;
+            };
+            let e = &kp_entries[ei];
+            if e.deleted || top_group(&e.group_path).is_empty() {
+                continue;
+            }
+            let h_kp = e.content_hash_hex();
+            let h_bw = it.content_hash_hex();
+            let kp_changed = h_kp != last_hash;
+            let bw_changed = h_bw != last_hash;
+            let needs_placement =
+                (h_kp == h_bw) || (kp_changed && !bw_changed) || (opts.force && h_kp != h_bw);
+            if needs_placement {
+                anyhow::bail!(
+                    "refusing to sync: Bitwarden folder listing is missing folder id {fid} referenced by item {:?}, and its pair needs a placement decision (probable partial listing); no changes made",
+                    it.name
+                );
+            }
+        }
+    }
+
     // Reconcile stale unmapped rows: an open `unmapped-bw-item` row whose
     // item is now live-mapped states something false, so resolve it.
     // After the listing guard on purpose: a refused sync makes no changes.
@@ -518,6 +581,27 @@ pub fn plan(
                     // uncommitted evidence. Otherwise the user
                     // permanently deleted it in Bitwarden: move the KP
                     // entry to the recycle bin (recoverable).
+                    // Completed-side orphan cleanup (same crash window
+                    // as the tombstone arm): a completed (`"keepass"` /
+                    // `"both"`) tombstone alongside a lingering mapping
+                    // means plan crashed between `record_tombstone` and
+                    // `delete_mapping_by_kp`. The pair is terminally
+                    // handled, so drop the mapping instead of skipping
+                    // past it forever: a binned entry then rests closed,
+                    // and an entry later restored from the bin syncs as
+                    // brand-new instead of being skipped by a stale row.
+                    // Engine-recycle sides keep their existing behavior
+                    // (absence re-runs the two-listing clock; trash
+                    // keeps its skip).
+                    if journal.tombstoned(&e.uuid)?
+                        && matches!(
+                            journal.tombstone_side(&e.uuid)?.as_deref(),
+                            Some("keepass") | Some("both")
+                        )
+                    {
+                        journal.delete_mapping_by_kp(&e.uuid)?;
+                        continue;
+                    }
                     if journal.tombstoned(&e.uuid)?
                         && journal.tombstone_side(&e.uuid)?.as_deref()
                             != Some("bitwarden-absence")
@@ -721,6 +805,43 @@ pub fn plan(
                 Some("keepass") | Some("both")
             )
         {
+            // Completed-propagation orphan check (2026-11-01 review):
+            // `record_tombstone` + `delete_mapping_by_kp` are separate
+            // autocommits in the completion branches below, so a crash
+            // between them leaves a mapping alongside a completed-side
+            // tombstone — and the old skip-before-mapping-check then hid
+            // the pair forever: the pair loop never iterates tombstones,
+            // the adopt loop skips stamped items, and the rebuild loop
+            // re-upserts the mapping for a tombstoned stamp, so merely
+            // deleting the mapping would oscillate without ever making
+            // the item visible. Resolve by outcome instead:
+            // - live, non-blocked item: quarantine (`tombstone-
+            //   reappeared`) — never trash on a stale record, never
+            //   ignore. The mapping is kept, so the row stays single
+            //   (dedupe) and the user can acknowledge it if intentional.
+            // - trashed or listing-absent item: genuinely complete —
+            //   drop the lingering mapping, no action.
+            // - blocked item: the early gate already quarantined it;
+            //   skip without double-reporting.
+            if let Some((bw_id, _)) = journal.mapping_by_kp(u)? {
+                if blocked_bw.contains(bw_id.as_str()) {
+                    continue;
+                }
+                match bw_by_id.get(bw_id.as_str()) {
+                    Some(&bi) if !bw_items[bi].trashed() => {
+                        actions.push(Action::Quarantine(QuarantineCase {
+                            kind: "tombstone-reappeared",
+                            kp_uuid: Some(*u),
+                            bw_id: Some(bw_id),
+                            title: bw_items[bi].name.clone(),
+                            detail: "KeePass entry is permanently deleted and its Bitwarden delete was recorded complete, but the Bitwarden item is live again (untrashed after completion, or a crash orphan); refusing to trash it or ignore it. Clear it by deleting the Bitwarden item, or acknowledge the row if the live item is intentional".into(),
+                        }));
+                    }
+                    _ => {
+                        journal.delete_mapping_by_kp(u)?;
+                    }
+                }
+            }
             continue;
         }
         if let Some((bw_id, _)) = journal.mapping_by_kp(u)? {
@@ -793,6 +914,30 @@ pub fn plan(
             }));
         }
     }
+
+    // Expire acknowledged rows whose condition cleared: an acknowledged
+    // row is re-emitted by plan every run while its condition persists
+    // (the insert dedupes on unresolved rows, so the single row
+    // survives), so an acknowledged row NOT among this plan's quarantine
+    // actions states something false — the item left the org, dropped
+    // its attachments, got adopted, or vanished — and resolves. Rows
+    // for conditions that persist stay acknowledged and silent.
+    // Apply-only rows (e.g. `bw_revision_changed`) are not plan-emitted:
+    // if their conflict reappears under a new kind, the old row expires
+    // here and the new kind's row takes over the nag — acknowledge is
+    // per row (kind + identity), not per item. This runs after every
+    // successful plan; the bail paths above return before it, so a
+    // refused sync still changes nothing.
+    let emitted: HashSet<(&str, Option<String>, Option<String>)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Quarantine(q) => {
+                Some((q.kind, q.kp_uuid.map(|u| u.to_string()), q.bw_id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    journal.resolve_stale_acknowledged(&emitted)?;
 
     Ok(Plan { actions })
 }
@@ -1054,6 +1199,7 @@ mod tests {
             item_type: 1,
             reprompt: None,
             collection_ids: vec![],
+            organization_id: None,
             attachments: vec![],
         }
     }
@@ -2337,10 +2483,30 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_arm_skips_completed_propagations() {
-        // Positive control for the rule above: a completed propagation
-        // ("keepass" user bin, or "both" sides deleted) still skips, even
-        // with a live Bitwarden item and a rebuilt mapping.
+    fn tombstone_arm_skips_completed_propagations_without_mapping() {
+        // The skip rule survives where it still applies: a completed
+        // propagation with NO lingering mapping and NO live item still
+        // skips. (A live item would not skip: a stamped one rebuilds
+        // its mapping first and lands in the orphan case below, and an
+        // unstamped one reaches the adopt loop's unmapped quarantine.)
+        for side in ["keepass", "both"] {
+            let j = test_journal();
+            let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+            j.record_tombstone(&uuid, Some("bw-1"), side).unwrap();
+            let mut tombs = HashSet::new();
+            tombs.insert(uuid);
+            let p = plan(&[], &tombs, &[], &[], &j, &SyncOpts::default()).unwrap();
+            assert!(p.actions.is_empty(), "side {side}: got {:?}", p.actions);
+        }
+    }
+
+    #[test]
+    fn tombstone_completed_orphan_with_live_item_quarantines() {
+        // Crash orphan: mapping + completed-side tombstone + live item.
+        // Old behavior skipped it forever (never synced, never
+        // quarantined, no error). New behavior quarantines it visibly
+        // and never trashes on a stale record; the mapping is kept so
+        // the row stays single (dedupe).
         for side in ["keepass", "both"] {
             let j = test_journal();
             let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
@@ -2351,7 +2517,336 @@ mod tests {
             let mut tombs = HashSet::new();
             tombs.insert(uuid);
             let p = plan(&[], &tombs, &[bi], &[], &j, &SyncOpts::default()).unwrap();
-            assert!(p.actions.is_empty(), "side {side}: got {:?}", p.actions);
+            assert_eq!(p.actions.len(), 1, "side {side}: got {:?}", p.actions);
+            assert!(
+                matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "tombstone-reappeared" && q.bw_id.as_deref() == Some("bw-1")),
+                "side {side}: expected tombstone-reappeared, got {:?}",
+                p.actions[0]
+            );
+            assert!(
+                j.mapping_by_kp(&uuid).unwrap().is_some(),
+                "side {side}: mapping must be kept while quarantined"
+            );
         }
+    }
+
+    #[test]
+    fn tombstone_completed_orphan_with_trashed_item_cleans_mapping() {
+        // Same orphan, but the item is trashed: genuinely complete, so
+        // the lingering mapping is dropped and no action is needed.
+        let j = test_journal();
+        let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        bi.deleted_date = Some("2026-10-03T00:00:00Z".into());
+        j.upsert_mapping(&uuid, "bw-1", &bi.content_hash_hex())
+            .unwrap();
+        j.record_tombstone(&uuid, Some("bw-1"), "keepass").unwrap();
+        let mut tombs = HashSet::new();
+        tombs.insert(uuid);
+        let p = plan(&[], &tombs, &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "got {:?}", p.actions);
+        assert_eq!(j.mapping_by_kp(&uuid).unwrap(), None);
+    }
+
+    #[test]
+    fn deleted_branch_completed_orphan_cleans_mapping() {
+        // Same crash window in the deleted branch's item-absent arm: a
+        // completed-side tombstone plus a lingering mapping used to skip
+        // forever. Now the mapping is dropped: the pair rests closed,
+        // and an entry later restored from the bin syncs as brand-new.
+        let j = test_journal();
+        let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        j.upsert_mapping(&uuid, "bw-1", "h").unwrap();
+        j.record_tombstone(&uuid, Some("bw-1"), "keepass").unwrap();
+        let p = plan(&kp, &HashSet::new(), &[], &[], &j, &SyncOpts::default()).unwrap();
+        assert!(p.actions.is_empty(), "got {:?}", p.actions);
+        assert_eq!(j.mapping_by_kp(&uuid).unwrap(), None);
+        // Second plan: live entry, no mapping, no item -> brand-new.
+        let p = plan(&kp, &HashSet::new(), &[], &[], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            matches!(&p.actions[0], Action::CreateBw { .. }),
+            "expected CreateBw, got {:?}",
+            p.actions
+        );
+    }
+
+    fn folder_guard_fixtures() -> (
+        crate::journal::Journal,
+        Vec<CanonicalEntry>,
+        BwItem,
+        Vec<crate::bw::BwFolder>,
+    ) {
+        // Mapped pair: KeePass entry in group "X", Bitwarden item in an
+        // unknown folder. The folder list knows only "f-known".
+        let j = test_journal();
+        let uuid: Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let mut kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        kp[0].group_path = "X".into();
+        let mut bi = bw_item("bw-1", Some("11111111-1111-1111-1111-111111111111"), "r1");
+        bi.folder_id = Some("f-unknown".into());
+        let folders = vec![crate::bw::BwFolder {
+            id: "f-known".into(),
+            name: "Known".into(),
+        }];
+        j.upsert_mapping(&uuid, "bw-1", &kp[0].content_hash_hex())
+            .unwrap();
+        (j, kp, bi, folders)
+    }
+
+    #[test]
+    fn partial_folder_listing_bails_for_placement_pairs() {
+        // KeePass-only change -> UpdateBw carrying a folderId, resolved
+        // against a truncated list -> bail, and the bail changes
+        // nothing (a stale unmapped row seeded beforehand stays open:
+        // reconcile never ran).
+        let (j, mut kp, bi, folders) = folder_guard_fixtures();
+        j.quarantine("unmapped-bw-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        kp[0].title = "changed".into();
+        let err = match plan(
+            &kp,
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        ) {
+            Ok(p) => panic!("expected bail, got {:?}", p.actions),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("partial listing"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 1);
+        assert_eq!(j.list_quarantine().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn partial_folder_listing_bails_for_agreeing_mismatched_pair() {
+        // Agreeing pair (hashes equal) whose top group differs from the
+        // unknown folder name -> a move UpdateBw -> bail.
+        let (j, kp, mut bi, folders) = folder_guard_fixtures();
+        // Helpers align: same title/username/password, empty notes/uris,
+        // stamps excluded from the hash.
+        bi.notes = Some("".into());
+        if let Some(l) = bi.login.as_mut() {
+            l.uris = Some(vec![]);
+        }
+        assert_eq!(
+            kp[0].content_hash_hex(),
+            bi.content_hash_hex(),
+            "fixture must agree for the move case"
+        );
+        j.upsert_mapping(&kp[0].uuid, "bw-1", &bi.content_hash_hex())
+            .unwrap();
+        let err = match plan(
+            &kp,
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        ) {
+            Ok(p) => panic!("expected bail, got {:?}", p.actions),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("partial listing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn partial_folder_listing_does_not_trip_non_placement_pairs() {
+        // Adopt path: unmapped item, unknown folder -> root fallback, no
+        // folder creation, no bail.
+        let j = test_journal();
+        let mut bi = bw_item("bw-9", None, "r1");
+        bi.folder_id = Some("f-unknown".into());
+        let folders = vec![crate::bw::BwFolder {
+            id: "f-known".into(),
+            name: "Known".into(),
+        }];
+        let p = plan(
+            &[],
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.kind == "unmapped-bw-item")),
+            "adopt path must quarantine, not bail: {:?}",
+            p.actions
+        );
+        // Foreign edit, default mode: quarantine carries no folderId,
+        // so no bail even though the folder is unknown.
+        let (j, kp, mut bi, folders) = folder_guard_fixtures();
+        bi.name = "t (edited in bitwarden)".into();
+        let p = plan(
+            &kp,
+            &HashSet::new(),
+            std::slice::from_ref(&bi),
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.kind == "foreign-bw-edit")),
+            "foreign edit must quarantine, not bail: {:?}",
+            p.actions
+        );
+        // Same foreign edit under --force: UpdateBw -> bail.
+        let err = match plan(
+            &kp,
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts {
+                force: true,
+                ..SyncOpts::default()
+            },
+        ) {
+            Ok(p) => panic!("expected bail, got {:?}", p.actions),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("partial listing"),
+            "force + foreign edit must bail: {err}"
+        );
+        // Root-group pair: UpdateBw resolves to no folder -> no bail.
+        let (j, mut kp, bi, folders) = folder_guard_fixtures();
+        kp[0].group_path = "".into();
+        kp[0].title = "changed".into();
+        let p = plan(
+            &kp,
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::UpdateBw { .. })),
+            "root-group update must plan, not bail: {:?}",
+            p.actions
+        );
+        // Trashed item: recycle/quarantine carries no folderId -> no bail.
+        let (j, kp, mut bi, folders) = folder_guard_fixtures();
+        bi.deleted_date = Some("2026-10-03T00:00:00Z".into());
+        let p = plan(
+            &kp,
+            &HashSet::new(),
+            &[bi],
+            &folders,
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::RecycleKp { .. })),
+            "trashed item must recycle, not bail: {:?}",
+            p.actions
+        );
+    }
+
+    #[test]
+    fn acknowledged_gate_row_stays_silent_but_blocked() {
+        // Acknowledge is silence, not bypass: the org row re-fires every
+        // run, stays listed and marked, stops counting as pending, and
+        // the item still gets no sync action.
+        let j = test_journal();
+        let bi = org_item("bw-1", None, "r1");
+        let p = plan(
+            &[],
+            &HashSet::new(),
+            std::slice::from_ref(&bi),
+            &[],
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.kind == "org-item")),
+            "expected org-item quarantine: {:?}",
+            p.actions
+        );
+        j.quarantine("org-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(j.acknowledge_quarantine(rows[0].0).unwrap());
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
+        // Second plan re-fires the gate: still blocked, still silent.
+        let p = plan(&[], &HashSet::new(), &[bi], &[], &j, &SyncOpts::default()).unwrap();
+        assert!(
+            p.actions.iter().all(|a| matches!(a, Action::Quarantine(_))),
+            "acknowledged item must get no sync action: {:?}",
+            p.actions
+        );
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 0);
+        let rows = j.list_quarantine().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "org-item");
+        assert!(rows[0].6, "row must stay listed and marked acknowledged");
+    }
+
+    #[test]
+    fn acknowledged_row_resolves_when_condition_clears() {
+        // The org row is acknowledged; then the item leaves the org.
+        // Plan no longer emits org-item for it, so the row resolves —
+        // and the item is no longer blocked (it reaches the adopt loop).
+        let j = test_journal();
+        let bi = org_item("bw-1", None, "r1");
+        j.quarantine("org-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        let rows = j.list_quarantine().unwrap();
+        assert!(j.acknowledge_quarantine(rows[0].0).unwrap());
+        let mut deorged = bi.clone();
+        deorged.collection_ids = vec![];
+        let p = plan(
+            &[],
+            &HashSet::new(),
+            &[deorged],
+            &[],
+            &j,
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert!(
+            p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.kind == "unmapped-bw-item")),
+            "de-orged item must reach the adopt loop: {:?}",
+            p.actions
+        );
+        assert!(
+            !p.actions
+                .iter()
+                .any(|a| matches!(a, Action::Quarantine(q) if q.kind == "org-item")),
+            "org-item must stop firing: {:?}",
+            p.actions
+        );
+        assert!(
+            j.list_quarantine().unwrap().is_empty(),
+            "acknowledged row must resolve when its condition clears"
+        );
     }
 }

@@ -337,3 +337,67 @@ fn put_does_not_hold_lock_while_waiting_on_stdin() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn quarantine_acknowledge_cli() {
+    // Acknowledge through the real binary: build a scratch journal with
+    // the library, acknowledge the row via the CLI, and prove the list
+    // marks it and the pending count drops to zero.
+    let dir = tmpdir("ack");
+    let journal = dir.join("sync.db");
+    {
+        use keepass_bw_sync::journal::Journal;
+        let j = Journal::open(&journal).unwrap();
+        j.quarantine("org-item", None, Some("bw-1"), "t", "d")
+            .unwrap();
+        j.quarantine("has-attachments", None, Some("bw-2"), "t", "d")
+            .unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 2);
+    }
+    let qcmd = |args: &[&str]| {
+        let mut c = Command::new(bin());
+        c.arg("quarantine").arg("--journal").arg(&journal);
+        for a in args {
+            c.arg(a);
+        }
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.output().unwrap()
+    };
+    let out = qcmd(&["acknowledge", "1"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("acknowledged quarantine row #1"),
+        "stdout: {stdout}"
+    );
+    let out = qcmd(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[org-item] [acknowledged]"),
+        "list must mark the acknowledged row: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[has-attachments] [acknowledged]"),
+        "unacknowledged row must stay unmarked: {stdout}"
+    );
+    {
+        use keepass_bw_sync::journal::Journal;
+        let j = Journal::open(&journal).unwrap();
+        assert_eq!(j.unresolved_quarantine_count().unwrap(), 1);
+    }
+    // Resolve output states the re-queue rule and points to acknowledge.
+    let out = qcmd(&["resolve", "2"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("resolved quarantine row #2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("re-queues it") && stdout.contains("acknowledge"),
+        "resolve output must state the re-queue rule: {stdout}"
+    );
+}

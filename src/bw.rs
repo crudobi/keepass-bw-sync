@@ -158,6 +158,17 @@ pub struct BwItem {
         deserialize_with = "null_as_default"
     )]
     pub collection_ids: Vec<String>,
+    /// Owning organization id from the serve payload's `organizationId`
+    /// (null/absent on personal items). Parsed and echoed on edit/stamp
+    /// PUTs alongside `collectionIds`: the payload-preservation half of
+    /// the plan-to-apply org race. It does NOT change the org gate,
+    /// which keys on non-empty `collectionIds` alone — an item with an
+    /// organization id but no collections still passes the gate, exactly
+    /// as before; this field only stops a full-replace PUT from dropping
+    /// the key. Whether serve honors the echoed keys for membership is
+    /// unproven without a live daemon (see the echo comments below).
+    #[serde(rename = "organizationId", default)]
+    pub organization_id: Option<String>,
     /// Attachment descriptors from the serve payload's `attachments`
     /// array (present on the cipher view for both list and get). A
     /// non-empty list means the item carries files this engine does not
@@ -194,6 +205,7 @@ impl std::fmt::Debug for BwItem {
             // for debugging; attachment file names can be descriptive
             // (e.g. a scan filename), so only the count is shown.
             .field("collection_ids", &self.collection_ids)
+            .field("organization_id", &self.organization_id)
             .field("attachment_count", &self.attachments.len())
             .finish()
     }
@@ -666,16 +678,24 @@ impl BwClient {
                 "uris": uris,
             }
         });
-        // Echo the source item's collections on edit: PUTs are full
-        // replaces, so omitting them would strip membership the item
-        // gained between plan and apply (the plan-time org gate only
-        // sees the plan-time listing). The next sync's gate then
-        // quarantines the item as org-item -- the echo is preservation,
-        // the gate is the backstop. Creates have no source item and
-        // never carry collections, so the key stays absent there.
+        // Echo the source item's collections and organization on edit:
+        // PUTs are full replaces, so omitting them would drop keys the
+        // item gained between plan and apply (the plan-time org gate
+        // only sees the plan-time listing). Honest claim: the PAYLOAD
+        // preserves the keys — whether serve honors them for membership
+        // is unproven without a live daemon, so this is not claimed as
+        // end-to-end membership preservation. The next sync's gate then
+        // quarantines the item as org-item; the gate is the backstop.
+        // Creates have no source item and never carry these keys, so
+        // they stay absent there.
         if let Some(src) = echo_src {
             if !src.collection_ids.is_empty() {
                 payload["collectionIds"] = serde_json::json!(src.collection_ids);
+            }
+            if let Some(org) = &src.organization_id {
+                if !org.is_empty() {
+                    payload["organizationId"] = serde_json::json!(org);
+                }
             }
         }
         payload
@@ -843,13 +863,20 @@ impl BwClient {
                 "uris": uris,
             },
         });
-        // Echo collections like item_payload does: a stamp PUT is a
-        // full replace too, and dropping membership here would strip
-        // it just as surely. (Adopt normally never reaches an org
-        // item -- the plan gate quarantines those first -- but the echo
-        // keeps the PUT safe if one ever does.)
+        // Echo collections and organization like item_payload does: a
+        // stamp PUT is a full replace too, and dropping these keys
+        // here would drop them just as surely. Same honest claim as
+        // there: the payload preserves the keys; serve-side membership
+        // semantics are unproven without a live daemon. (Adopt normally
+        // never reaches an org item -- the plan gate quarantines those
+        // first -- but the echo keeps the PUT safe if one ever does.)
         if !it.collection_ids.is_empty() {
             payload["collectionIds"] = serde_json::json!(it.collection_ids);
+        }
+        if let Some(org) = &it.organization_id {
+            if !org.is_empty() {
+                payload["organizationId"] = serde_json::json!(org);
+            }
         }
         let (status, bytes) =
             self.exchange_retry(&format!("PUT stamp item {id}"), "parse PUT stamp item", || {
@@ -1164,16 +1191,22 @@ pub(crate) mod tests {
             },
             "fields": [],
             "collectionIds": ["coll-1", "coll-2"],
+            "organizationId": "org-1",
             "revisionDate": "r1", "deletedDate": null
         }))
         .unwrap();
         let entry = entry();
         let payload = BwClient::item_payload(&entry, None, "hashhex", Some(&src));
         assert_eq!(payload["collectionIds"], serde_json::json!(["coll-1", "coll-2"]));
+        assert_eq!(payload["organizationId"], serde_json::json!("org-1"));
         let payload = BwClient::item_payload(&entry, None, "hashhex", None);
         assert!(
             payload.get("collectionIds").is_none(),
             "creates must not carry a collections key, got: {payload}"
+        );
+        assert!(
+            payload.get("organizationId").is_none(),
+            "creates must not carry an organization key, got: {payload}"
         );
     }
 
@@ -1189,6 +1222,7 @@ pub(crate) mod tests {
                 },
                 "fields": [],
                 "collectionIds": ["coll-9"],
+                "organizationId": "org-9",
                 "revisionDate": "r1", "deletedDate": null
             }
         })
@@ -1203,6 +1237,7 @@ pub(crate) mod tests {
         assert_eq!(captured.len(), 2);
         let put = serde_json::from_slice::<serde_json::Value>(&captured[1].1).unwrap();
         assert_eq!(put["collectionIds"], serde_json::json!(["coll-9"]));
+        assert_eq!(put["organizationId"], serde_json::json!("org-9"));
     }
 
     #[test]

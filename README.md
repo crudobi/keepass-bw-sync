@@ -37,25 +37,35 @@ True perfect forward secrecy is **not** achievable for data at rest: both
 vaults have persistent master keys, so a compromised master secret decrypts
 everything ever encrypted under it. What this engine does instead:
 
-- Both vaults are decrypted **strictly in RAM**; secrets live in `Secret`,
+- Both vaults are decrypted **strictly in RAM**; only entry passwords and the master password live in `Secret`,
   a `Vec<u8>` newtype that is zeroized on drop and implements no
-  `Debug`/`Display`/`Clone`/`Serialize`.
+  `Debug`/`Display`/`Clone`/`Serialize`; TOTP seeds, notes,
+  custom-field values, and keyfile bytes are plain in RAM.
 - Transient plaintext at the Bitwarden JSON boundary uses
   `zeroize::Zeroizing<String>`.
-- The SQLite journal stores **hashes and identities only** — never secrets.
+- The SQLite journal stores **hashes and identities only** — never secrets —
+  but the hashes are unsalted SHA-256, so a weak password is
+  offline-brute-forceable from a stolen journal.
 - No plaintext is ever written to disk: `.kdbx` saves go through
   temp-file + fsync + atomic rename; `bw export --format json` is never used.
 - The shipped `bw-serve.service` runs `bw serve` permanently unlocked on
   loopback (`Restart=always`) — the daemon form of this tool is NOT
-  short-lived unlock → sync → wipe. Its mitigations are the loopback-only
-  bind, `User=crudobi`, `NoNewPrivileges`, and `PrivateTmp`; on a
-  multi-user box, seal or socket it further (see Known limitations).
+  short-lived unlock → sync → wipe. Its confinement is the loopback-only
+  bind, `User=crudobi`, `NoNewPrivileges`, and `PrivateTmp` — but `bw
+  serve` has NO peer authentication on loopback TCP, so any local UID
+  can dump, create, edit, and trash vault items through the API today.
+  Those mitigations confine the daemon process, not its API peers.
+  Low severity on a true single-user box; on a multi-user box this
+  needs a real boundary (Unix socket, nftables owner-match, or an auth
+  proxy), which is not implemented yet (see Known limitations).
   Manual runs are short-lived by contrast, and `BW_SESSION` is never
   persisted by this tool.
 
 Known limitations: `reqwest`/`serde_json` make their own in-RAM copies of
 request bodies that we cannot zeroize; the `bw serve` leg is plaintext HTTP
-on loopback (fine single-user; seal or socket it on multi-user boxes).
+on loopback with no peer authentication (fine on a true single-user
+box; any local UID can use it — sealing it needs a Unix socket,
+nftables owner-match, or an auth proxy, none implemented yet).
 
 ## How it works
 
@@ -112,6 +122,7 @@ keepass-bw-sync sync --dry-run \
 # have dealt with it:
 keepass-bw-sync quarantine --journal /path/to/sync.db
 keepass-bw-sync quarantine --journal /path/to/sync.db resolve <id>
+keepass-bw-sync quarantine --journal /path/to/sync.db acknowledge <id>
 ```
 
 Master password comes from `KBS_MASTER_PASSWORD` or an interactive prompt.
@@ -123,11 +134,23 @@ sync), `unmapped-bw-item` (Bitwarden-only; adopt it with `sync
 since last sync), `delete-vs-edit`, `absence-recycle-reappeared` /
 `trash-recycle-reappeared` (an engine-recycled entry whose Bitwarden
 item came back unchanged — restore the entry from the KeePass recycle
-bin, or delete the Bitwarden item, to clear it). Adopting an item with
+bin, or delete the Bitwarden item, to clear it), `totp-name-collision`
+(a Bitwarden custom field named like a TOTP source — rename the field
+to clear it), `duplicate-field-name` (two Bitwarden custom fields
+sharing a name — rename one to clear it), `orphan_bw_stamp` (a
+Bitwarden item stamped for a KeePass entry that does not exist —
+remove the stamp fields to re-adopt, or resolve if intentional), `tombstone-reappeared` (a completed delete whose Bitwarden item is live again — delete the Bitwarden item, or acknowledge if intentional).
+Resolving a row whose condition persists only clears it until the next
+sync, which re-queues it: for a condition you have accepted (an org
+item you will not sync, an item with attachments), use `quarantine
+acknowledge <id>` instead — the row stays listed and marked, its item
+stays untouched, and it no longer counts as pending; if the condition
+later clears, the row auto-resolves on the next sync. Adopting an item with
 `sync --adopt` resolves its `unmapped-bw-item` rows in the same journal
 transaction as the mapping, and each sync reconciles stale unmapped
 rows for already-mapped items; every other kind still needs an explicit
-`quarantine resolve`.
+`quarantine resolve` (or `acknowledge`, for a persistent condition you
+have accepted).
 
 ### Bitwarden CLI setup (one time)
 

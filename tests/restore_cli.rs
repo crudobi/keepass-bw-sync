@@ -353,3 +353,121 @@ fn restore_ignores_proxy_env() {
         "restore must reach the stub directly despite proxy env"
     );
 }
+
+fn spawn_stub_titles() -> String {
+    // Like spawn_stub, but the listing carries one org-owned item and
+    // one item with attachments, so the restore warnings must name them.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+                continue;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                let t = line.trim();
+                if t.is_empty() {
+                    break;
+                }
+                if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                let _ = reader.read_exact(&mut body);
+            }
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let resp_body = match (parts[0], parts[1]) {
+                ("POST", "/sync") => serde_json::json!({"success": true}),
+                ("GET", "/list/object/items") => serde_json::json!({
+                    "success": true,
+                    "data": {"object": "list", "data": [
+                        {
+                            "id": "bw-org", "name": "org-owned", "notes": null,
+                            "favorite": false, "folderId": null, "type": 1,
+                            "reprompt": 0,
+                            "login": {"username": "o", "password": "pw",
+                                      "totp": null, "uris": []},
+                            "fields": [],
+                            "collectionIds": ["coll-1"],
+                            "revisionDate": "r1", "deletedDate": null
+                        },
+                        {
+                            "id": "bw-blob", "name": "with-blobs", "notes": null,
+                            "favorite": false, "folderId": null, "type": 1,
+                            "reprompt": 0,
+                            "login": {"username": "b", "password": "pw",
+                                      "totp": null, "uris": []},
+                            "fields": [],
+                            "attachments": [{"id": "att-1", "fileName": "scan.pdf", "size": 10}],
+                            "revisionDate": "r1", "deletedDate": null
+                        },
+                        {
+                            "id": "bw-plain", "name": "plain", "notes": null,
+                            "favorite": false, "folderId": null, "type": 1,
+                            "reprompt": 0,
+                            "login": {"username": "p", "password": "pw",
+                                      "totp": null, "uris": []},
+                            "fields": [],
+                            "revisionDate": "r1", "deletedDate": null
+                        }
+                    ]}
+                }),
+                ("GET", "/list/object/folders") => serde_json::json!({
+                    "success": true,
+                    "data": {"object": "list", "data": []}
+                }),
+                _ => serde_json::json!({"success": false, "message": "unexpected"}),
+            }
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn restore_warnings_name_skipped_and_blob_less_titles() {
+    let dir = tmpdir("titles");
+    let kdbx = dir.join("restored.kdbx");
+    let journal = dir.join("sync.db");
+    let base = spawn_stub_titles();
+
+    let out = restore_cmd(&kdbx, &journal, &base).output().unwrap();
+    assert!(
+        out.status.success(),
+        "restore failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("skipped_org=1 restored_without_blobs=1"),
+        "counts: {stdout}"
+    );
+    assert!(
+        stdout.contains("org-owned"),
+        "org warning must name the item: {stdout}"
+    );
+    assert!(
+        stdout.contains("with-blobs"),
+        "blob warning must name the item: {stdout}"
+    );
+}

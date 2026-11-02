@@ -3,7 +3,10 @@
 //! Design: local .kdbx is the source of truth. Identity is a hybrid of a
 //! Bitwarden custom-field stamp (KBS_SYNC_ID) and a local SQLite journal
 //! (watermarks, content hashes, tombstones). Conflicts quarantine for human
-//! review. KeePass-side secrets are held in zeroizing containers; the
+//! review. Only entry passwords and the master password are held in
+//! zeroizing containers (`Secret`); TOTP seeds, notes, custom-field
+//! values, and keyfile bytes are plain in RAM, and journal hashes are
+//! unsalted SHA-256 (brute-forceable for weak passwords). The
 //! Bitwarden side necessarily materializes plaintext JSON in memory at the
 //! `bw serve` boundary (loopback only) — the client wipes the copies it
 //! controls, but the payload structures themselves are plain.

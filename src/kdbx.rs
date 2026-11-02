@@ -1060,6 +1060,7 @@ mod tests {
             item_type: 1,
             reprompt: None,
             collection_ids: vec![],
+            organization_id: None,
             attachments: vec![],
         };
         {
@@ -1103,6 +1104,7 @@ mod tests {
             item_type: 1,
             reprompt: None,
             collection_ids: vec![],
+            organization_id: None,
             attachments: vec![],
         }
     }

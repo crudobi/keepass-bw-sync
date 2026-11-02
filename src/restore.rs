@@ -79,10 +79,15 @@ pub struct RestoreReport {
     /// (non-empty `collectionIds`): restore never copies org items into
     /// a personal vault, mirroring the sync gate.
     pub skipped_org: usize,
+    /// Titles of the skipped org-owned items, in listing order.
+    pub skipped_org_titles: Vec<String>,
     /// Items restored without their attachment blobs: the entry itself
     /// is restored, but this engine does not transfer blobs, so the
     /// restore is incomplete for these items by exactly that much.
     pub restored_without_blobs: usize,
+    /// Titles of the items restored without their attachment blobs, in
+    /// listing order.
+    pub restored_without_blobs_titles: Vec<String>,
 }
 
 /// Fail closed when a restore target already holds entries: restoring
@@ -141,6 +146,7 @@ pub fn restore_into(
         // personal vault. Skipped, counted, no entry, no mapping.
         if it.org_owned() {
             report.skipped_org += 1;
+            report.skipped_org_titles.push(it.name.clone());
             continue;
         }
         let folder_name = it
@@ -191,6 +197,7 @@ pub fn restore_into(
         // blobs are not, and the report must say so (see module docs).
         if it.has_attachments() {
             report.restored_without_blobs += 1;
+            report.restored_without_blobs_titles.push(it.name.clone());
         }
         journal_ops.push(JournalOp::UpsertMapping {
             kp_uuid: uuid,
@@ -257,6 +264,7 @@ mod tests {
             item_type: 1,
             reprompt: None,
             collection_ids: vec![],
+            organization_id: None,
             attachments: vec![],
         }
     }
@@ -280,7 +288,9 @@ mod tests {
                 unstamped: 0,
                 skipped_trashed: 0,
                 skipped_org: 0,
-                restored_without_blobs: 0
+                skipped_org_titles: vec![],
+                restored_without_blobs: 0,
+                restored_without_blobs_titles: vec![],
             }
         );
         let entries = extract_entries(&vault.db);
@@ -332,6 +342,29 @@ mod tests {
             &ops[0],
             JournalOp::UpsertMapping { hash, .. } if hash == &live
         ));
+    }
+
+    #[test]
+    fn restore_report_names_skipped_org_and_blob_less_titles() {
+        let mut vault = test_vault();
+        let mut org = bw_item("bw-org", "org-one", None, false);
+        org.collection_ids = vec!["coll-1".into()];
+        let mut blobs = bw_item("bw-blob", "blob-one", None, false);
+        blobs.attachments = vec![BwAttachment {
+            id: Some("att-1".into()),
+            file_name: Some("scan.pdf".into()),
+            size: Some(10),
+        }];
+        let plain = bw_item("bw-plain", "plain-one", None, false);
+        let (report, _) = restore_into(&mut vault.db, &[org, blobs, plain], &folders()).unwrap();
+        assert_eq!(report.skipped_org, 1);
+        assert_eq!(report.skipped_org_titles, vec!["org-one".to_string()]);
+        assert_eq!(report.restored_without_blobs, 1);
+        assert_eq!(
+            report.restored_without_blobs_titles,
+            vec!["blob-one".to_string()]
+        );
+        assert_eq!(report.unstamped, 2);
     }
 
     #[test]

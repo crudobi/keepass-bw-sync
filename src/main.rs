@@ -116,7 +116,9 @@ enum Cmd {
     /// with --update). Secret material comes only from stdin or a file,
     /// never argv (argv is visible in `ps`). Reads/writes the local .kdbx
     /// only: no journal writes, no Bitwarden. The journal flock is held
-    /// for the whole read-modify-save so put cannot race a sync run.
+    /// for the modify-save only (stdin is read before the lock) so an
+    /// interactive put waiting on stdin cannot block the hourly sync;
+    /// put and sync still cannot race the vault save.
     Put {
         /// Path to the KeePass2 database.
         #[arg(long)]
@@ -179,6 +181,17 @@ enum Cmd {
 enum QuarantineCmd {
     /// Mark a quarantine row resolved.
     Resolve {
+        /// Row id from the quarantine listing.
+        id: i64,
+    },
+    /// Acknowledge a quarantine row: it stays listed (marked) and its
+    /// item stays untouched, but it no longer counts as pending or
+    /// triggers the sync nag. For persistent conditions you have
+    /// accepted (an org item, an item with attachments). If the
+    /// condition later clears, the row auto-resolves on the next sync.
+    /// Resolving a persistent row only clears it until the next sync
+    /// re-queues it; acknowledge is the silence path, not a bypass.
+    Acknowledge {
         /// Row id from the quarantine listing.
         id: i64,
     },
@@ -511,12 +524,18 @@ fn main() -> Result<()> {
                     "warning: {} restored entries are missing their attachment blobs (not synced); the blobs still exist in Bitwarden",
                     report.restored_without_blobs
                 );
+                for t in &report.restored_without_blobs_titles {
+                    println!("    - {t}");
+                }
             }
             if report.skipped_org > 0 {
                 println!(
                     "warning: {} org-owned items were skipped (never copied into a personal vault)",
                     report.skipped_org
                 );
+                for t in &report.skipped_org_titles {
+                    println!("    - {t}");
+                }
             }
         }
         Cmd::Quarantine { journal, action } => {
@@ -525,6 +544,14 @@ fn main() -> Result<()> {
                 Some(QuarantineCmd::Resolve { id }) => {
                     if j.resolve_quarantine(id)? {
                         println!("resolved quarantine row #{id}");
+                        println!("note: if its condition persists (e.g. org ownership, attachments), the next sync re-queues it; use `quarantine acknowledge {id}` for a condition you have accepted");
+                    } else {
+                        println!("no unresolved quarantine row #{id}");
+                    }
+                }
+                Some(QuarantineCmd::Acknowledge { id }) => {
+                    if j.acknowledge_quarantine(id)? {
+                        println!("acknowledged quarantine row #{id} (it stays listed, its item stays untouched, and it no longer counts as pending)");
                     } else {
                         println!("no unresolved quarantine row #{id}");
                     }
@@ -534,8 +561,11 @@ fn main() -> Result<()> {
                     if rows.is_empty() {
                         println!("quarantine is empty");
                     }
-                    for (id, kind, kp, bw_id, title, detail) in rows {
-                        println!("#{id} [{kind}] {title} kp={kp:?} bw={bw_id:?}\n    {detail}");
+                    for (id, kind, kp, bw_id, title, detail, ack) in rows {
+                        let mark = if ack { " [acknowledged]" } else { "" };
+                        println!(
+                            "#{id} [{kind}]{mark} {title} kp={kp:?} bw={bw_id:?}\n    {detail}"
+                        );
                     }
                 }
             }

@@ -83,7 +83,18 @@ fn handle(mut stream: std::net::TcpStream, state: &Arc<Mutex<Stub>>) {
             if let Some(item) = st.items.iter_mut().find(|i| i["id"] == id) {
                 // Replace semantics: the request body is the new view. Only
                 // the view keys travel; id/revisionDate are server-managed.
-                for k in ["type", "name", "notes", "favorite", "folderId", "reprompt", "fields", "login"] {
+                for k in [
+                    "type",
+                    "name",
+                    "notes",
+                    "favorite",
+                    "folderId",
+                    "reprompt",
+                    "fields",
+                    "login",
+                    "collectionIds",
+                    "organizationId",
+                ] {
                     if let Some(val) = v.get(k) {
                         item[k] = val.clone();
                     }
@@ -395,4 +406,47 @@ fn crash_between_vault_save_and_journal_commit_recovers_without_loss_or_duplicat
     // The watermark caught up to the agreed content at plan time.
     let (_, watermark) = journal.mapping_by_kp(&github.uuid).unwrap().unwrap();
     assert_eq!(watermark, github.content_hash_hex());
+}
+
+#[test]
+fn stub_put_carries_collection_keys() {
+    // Direct stub-level proof for the org-echo change: a PUT carrying
+    // both org keys must persist them on the stub item, like the real
+    // serve's replace semantics. (A full engine-flow proof is
+    // structurally impossible in one sync call: an item carrying
+    // collections at plan time is gate-quarantined before any edit, and
+    // plan/apply cannot be interleaved from outside a single sync.)
+    let (base, state) = spawn_stub();
+    {
+        let mut st = state.lock().unwrap();
+        st.items.push(serde_json::json!({
+            "id": "bw-9", "name": "t", "notes": null, "favorite": false,
+            "folderId": null, "type": 1, "reprompt": null,
+            "login": {"username": "u", "password": "p", "totp": null, "uris": []},
+            "fields": [], "collectionIds": [], "revisionDate": "r1", "deletedDate": null
+        }));
+    }
+    use std::io::{Read, Write};
+    let addr = base.trim_start_matches("http://");
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    let body = serde_json::json!({
+        "type": 1, "name": "t", "notes": null, "favorite": false,
+        "folderId": null, "reprompt": null, "fields": [],
+        "login": {"username": "u", "password": "p", "totp": null, "uris": []},
+        "collectionIds": ["coll-1"], "organizationId": "org-1"
+    })
+    .to_string();
+    let req = format!(
+        "PUT /object/item/bw-9 HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    assert!(resp.contains("200"), "PUT failed: {resp}");
+    let st = state.lock().unwrap();
+    let item = st.items.iter().find(|i| i["id"] == "bw-9").unwrap();
+    assert_eq!(item["collectionIds"], serde_json::json!(["coll-1"]));
+    assert_eq!(item["organizationId"], serde_json::json!("org-1"));
 }
