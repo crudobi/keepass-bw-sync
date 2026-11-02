@@ -146,3 +146,21 @@
 - missing_bw rows are deleted with their mapping.
 - bw-serve.sh unlock stderr now goes to a 0600 mktemp file,
   removed on exit (takes effect on next service restart).
+
+## Round-4 top batch (2026-11-01)
+
+- Org-membership echo now carries `organizationId` alongside
+  `collectionIds`; stub PUT proves both keys through. Claim kept
+  honest: payload preservation, not end-to-end membership proof.
+- Tombstone crash orphan closed: a completed-side tombstone with
+  a lingering mapping quarantines a live item as
+  `tombstone-reappeared` instead of hiding it forever.
+- Partial folder listings now fail closed when a placement
+  decision needs an unknown folder id.
+- `quarantine acknowledge <id>`: accepted persistent conditions
+  stop nagging (and stop counting as pending) without bypassing
+  any gate; journal schema v3 (additive `acknowledged` column,
+  migrates on open).
+- Restore warnings now name the skipped-org and blob-less items.
+- README kinds list completed; zeroization and daemon
+  threat-model docs corrected to what the code actually does.
