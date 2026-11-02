@@ -16,6 +16,8 @@ use keepass::db::{fields, Database, Entry, EntryId, GroupId, History};
 use keepass::DatabaseKey;
 use uuid::Uuid;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+
 use crate::canonical::CanonicalEntry;
 use crate::secret::Secret;
 use crate::stamps::{SYNC_HASH_FIELD, SYNC_ID_FIELD};
@@ -157,7 +159,7 @@ fn walk(db: &Database) -> (Vec<WalkedEntry>, Vec<(GroupId, String, String)>) {
 /// consumed as TOTP, never synced as ordinary custom fields — leaving the
 /// KeePassXC seed/settings in the custom set would hash differently from
 /// the Bitwarden side forever (its TOTP lives in `login.totp`).
-fn is_totp_source_field(name: &str) -> bool {
+pub(crate) fn is_totp_source_field(name: &str) -> bool {
     name.eq_ignore_ascii_case("totp")
         || name.eq_ignore_ascii_case("otp")
         || name.eq_ignore_ascii_case("TOTP Seed")
@@ -171,6 +173,15 @@ fn extra_uri_index(name: &str) -> Option<u32> {
     let n: u32 = name.strip_prefix("URL ")?.parse().ok()?;
     (n >= 2).then_some(n)
 }
+
+/// RFC 3986 unreserved characters pass through unescaped in an otpauth
+/// label; everything else is percent-encoded, so titles with spaces or
+/// specials produce a well-formed URI strict parsers accept.
+const OTPAUTH_LABEL_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// TOTP extraction, in precedence order:
 ///
@@ -197,7 +208,14 @@ fn extract_totp(entry: &Entry) -> Option<String> {
     let seed = field("TOTP Seed")?;
     let (digits, period, algorithm) =
         parse_totp_settings(field("TOTP Settings").as_deref());
-    let label = entry.get_title().unwrap_or_default();
+    // Percent-encode the label: a raw title with spaces or specials
+    // makes a technically malformed URI strict parsers may reject.
+    // The secret is a query parameter, so its parsing is unaffected;
+    // only the label changes, so existing entries take one
+    // self-healing hash update with content preserved.
+    let label =
+        utf8_percent_encode(entry.get_title().unwrap_or_default(), OTPAUTH_LABEL_SET)
+            .to_string();
     Some(format!(
         "otpauth://totp/{label}?secret={}&digits={digits}&period={period}&algorithm={algorithm}",
         seed.replace([' ', '-'], "")
@@ -952,6 +970,27 @@ mod tests {
             get(&db, "otp-entry", "totp"),
             "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=6"
         );
+    }
+
+    #[test]
+    fn otpauth_label_is_percent_encoded() {
+        // Titles with spaces/specials must produce a well-formed URI;
+        // the secret and parameters must be untouched by the encoding.
+        let mut db = Database::new();
+        let root = db.root().id();
+        let eid = add_entry(&mut db, root, "My Bank (personal)");
+        let mut e = db.entry_mut(eid).unwrap();
+        e.set_protected("TOTP Seed", "JBSWY3DPEHPK3PXP");
+        e.set_protected("TOTP Settings", "45;8");
+        let totp = get(&db, "My Bank (personal)", "totp");
+        assert!(
+            totp.starts_with("otpauth://totp/My%20Bank%20%28personal%29?secret="),
+            "label must be encoded, got: {totp}"
+        );
+        assert!(totp.contains("JBSWY3DPEHPK3PXP"), "secret must survive: {totp}");
+        assert!(totp.contains("digits=8"), "digits must survive: {totp}");
+        assert!(totp.contains("period=45"), "period must survive: {totp}");
+        assert!(!totp.contains("My Bank"), "raw label must not appear: {totp}");
     }
 
     #[test]

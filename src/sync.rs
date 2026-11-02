@@ -123,6 +123,22 @@ fn is_engine_recycle_side(side: Option<&str>) -> bool {
     )
 }
 
+/// First custom-field name that appears twice on a Bitwarden item, if
+/// any. KeePass fields are name-keyed, so a duplicated name would
+/// silently drop the non-last value on writeback -- the plan gate
+/// quarantines instead.
+fn duplicate_field_name(it: &BwItem) -> Option<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    it.fields.iter().find_map(|f| {
+        if seen.contains(f.name.as_str()) {
+            Some(f.name.as_str())
+        } else {
+            seen.insert(f.name.as_str());
+            None
+        }
+    })
+}
+
 /// Build the sync plan.
 ///
 /// Not pure — and deliberately so (see the purity note below). `plan()`
@@ -239,6 +255,22 @@ pub fn plan(
         }
     }
 
+    // Folder-listing guard, the analogue of the items guard above: a
+    // folder listing that came back empty while items reference folders
+    // is a partial listing, not a folderless vault -- and `folder_for`
+    // would then create duplicate same-named folders server-side on
+    // apply. A genuinely folderless vault (empty folder list, no item
+    // referencing a folder) syncs fine.
+    let folder_refs = bw_items
+        .iter()
+        .filter(|it| it.folder_id.as_deref().is_some_and(|f| !f.is_empty()))
+        .count();
+    if folders.is_empty() && folder_refs > 0 {
+        anyhow::bail!(
+            "refusing to sync: Bitwarden listed 0 folders but {folder_refs} item(s) reference a folder (probable partial listing); no changes made"
+        );
+    }
+
     // Reconcile stale unmapped rows: an open `unmapped-bw-item` row whose
     // item is now live-mapped states something false, so resolve it.
     // After the listing guard on purpose: a refused sync makes no changes.
@@ -258,7 +290,9 @@ pub fn plan(
     // Fail-closed gates that fire BEFORE any other action for the item,
     // in default mode and under --writeback/--force alike (those flags
     // resolve conflicts; they never override a do-not-touch): org-owned
-    // items (non-empty `collectionIds`) and items with attachments. Each
+    // items (non-empty `collectionIds`), items with attachments, BW
+    // items carrying a TOTP-source custom-field name, and BW items with
+    // duplicate custom-field names. Each
     // blocked item gets exactly one quarantine here; every later loop
     // skips blocked ids, so the engine never creates, edits, stamps, or
     // trashes one.
@@ -284,6 +318,40 @@ pub fn plan(
                 bw_id: Some(it.id.clone()),
                 title: it.name.clone(),
                 detail: "has attachments, which this engine does not sync — skipped, no data changed".into(),
+            }));
+        } else if let Some(field) = it
+            .fields
+            .iter()
+            .find(|f| crate::kdbx::is_totp_source_field(&f.name))
+        {
+            // KeePass excludes TOTP-source names from its custom set, so
+            // a Bitwarden custom field with one of those names can never
+            // converge: the two sides hash it differently forever.
+            // Quarantine instead of silently dropping or renaming it.
+            blocked_bw.insert(it.id.as_str());
+            actions.push(Action::Quarantine(QuarantineCase {
+                kind: "totp-name-collision",
+                kp_uuid: stamp_uuid(it),
+                bw_id: Some(it.id.clone()),
+                title: it.name.clone(),
+                detail: format!(
+                    "Bitwarden item {:?} carries a custom field named {:?}, which is a TOTP-source name on the KeePass side -- the two sides can never converge on it, so it is quarantined instead of synced",
+                    it.name, field.name
+                ),
+            }));
+        } else if let Some(dup) = duplicate_field_name(it) {
+            // KeePass fields are name-keyed, so a duplicated Bitwarden
+            // name would silently drop the non-last value on writeback.
+            blocked_bw.insert(it.id.as_str());
+            actions.push(Action::Quarantine(QuarantineCase {
+                kind: "duplicate-field-name",
+                kp_uuid: stamp_uuid(it),
+                bw_id: Some(it.id.clone()),
+                title: it.name.clone(),
+                detail: format!(
+                    "Bitwarden item {:?} carries duplicate custom-field name {:?}; KeePass fields are name-keyed, so syncing it would silently drop a value -- quarantined instead",
+                    it.name, dup
+                ),
             }));
         }
     }
@@ -1223,6 +1291,116 @@ mod tests {
             p.actions.len()
         );
         assert!(!j.was_missing("bw-4").unwrap());
+    }
+
+    #[test]
+    fn folder_guard_bails_on_empty_folder_listing_with_references() {
+        let j = test_journal();
+        let mut item = bw_item("bw-1", None, "r1");
+        item.folder_id = Some("folder-1".into());
+        let err = match plan(&[], &HashSet::new(), &[item], &[], &j, &SyncOpts::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("folder guard must bail on empty folder listing with references"),
+        };
+        assert!(
+            err.to_string().contains("0 folders"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn folderless_vault_with_empty_folder_listing_syncs() {
+        // Empty folder list + no item referencing a folder is a
+        // genuinely folderless vault, not a partial listing.
+        let j = test_journal();
+        let item = bw_item("bw-1", None, "r1");
+        let p =
+            plan(&[], &HashSet::new(), &[item], &[], &j, &SyncOpts::default()).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(
+            matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "unmapped-bw-item"),
+            "expected unmapped quarantine, got {:?}", p.actions[0]
+        );
+    }
+
+    #[test]
+    fn totp_name_collision_quarantines_under_all_modes() {
+        let mut item = bw_item("bw-1", None, "r1");
+        item.fields.push(crate::bw::BwField {
+            name: "TOTP Seed".into(),
+            value: "JBSWY3DPEHPK3PXP".into(),
+            field_type: 0,
+        });
+        for opts in [
+            SyncOpts::default(),
+            SyncOpts { writeback: true, force: false, adopt: false },
+            SyncOpts { writeback: false, force: true, adopt: false },
+        ] {
+            let j = test_journal();
+            let p =
+                plan(&[], &HashSet::new(), &[item.clone()], &[], &j, &opts).unwrap();
+            assert_eq!(p.actions.len(), 1);
+            assert!(
+                matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "totp-name-collision"),
+                "expected totp-name-collision, got {:?}", p.actions[0]
+            );
+        }
+    }
+
+    #[test]
+    fn totp_collision_does_not_block_other_items() {
+        let mut colliding = bw_item("bw-1", None, "r1");
+        colliding.fields.push(crate::bw::BwField {
+            name: "totp".into(),
+            value: "x".into(),
+            field_type: 0,
+        });
+        let kp = vec![entry("11111111-1111-1111-1111-111111111111")];
+        let p = plan(
+            &kp,
+            &HashSet::new(),
+            &[colliding],
+            &[],
+            &test_journal(),
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        // The new KeePass entry still plans its create; the colliding
+        // item gets exactly its quarantine.
+        assert!(p.actions.iter().any(|a| matches!(a, Action::CreateBw { .. })));
+        assert!(p.actions.iter().any(
+            |a| matches!(a, Action::Quarantine(q) if q.kind == "totp-name-collision")
+        ));
+        assert_eq!(p.actions.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_field_name_quarantines() {
+        let mut item = bw_item("bw-1", None, "r1");
+        item.fields.push(crate::bw::BwField {
+            name: "api-key".into(),
+            value: "first".into(),
+            field_type: 0,
+        });
+        item.fields.push(crate::bw::BwField {
+            name: "api-key".into(),
+            value: "second".into(),
+            field_type: 0,
+        });
+        let p = plan(
+            &[],
+            &HashSet::new(),
+            &[item],
+            &[],
+            &test_journal(),
+            &SyncOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert!(
+            matches!(&p.actions[0], Action::Quarantine(q) if q.kind == "duplicate-field-name"),
+            "expected duplicate-field-name, got {:?}", p.actions[0]
+        );
     }
 
     #[test]

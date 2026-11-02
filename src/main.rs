@@ -592,13 +592,17 @@ fn main() -> Result<()> {
             // read-modify-save: put and sync share the vault file and its
             // .kdbx.tmp path, and a racing sync save used to silently
             // erase a put entry (its older in-memory DB renamed over the
-            // put, with nothing anywhere detecting the loss).
+            // put, with nothing anywhere detecting the loss). The lock
+            // is taken AFTER reading stdin: an interactive put waiting
+            // on stdin must not block the hourly sync (which fails fast
+            // on a contended lock) -- only the read-modify-save itself
+            // needs the lock.
             let journal_path = journal.unwrap_or_else(|| kdbx.with_file_name("sync.db"));
-            let _lock = acquire_journal_lock(&journal_path)?;
 
             let password =
                 read_secret_input("password", password_stdin, password_file.as_deref())?;
             let notes = read_secret_input("notes", notes_stdin, notes_file.as_deref())?;
+            let _lock = acquire_journal_lock(&journal_path)?;
             let mut vault = open_cli_vault(&kdbx, &keyfile)?;
             // KDBX3 is read-only for this tool: refuse before mutating.
             vault.require_writable()?;

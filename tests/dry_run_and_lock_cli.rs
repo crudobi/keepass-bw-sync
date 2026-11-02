@@ -259,3 +259,81 @@ fn journal_lock_contention_fails_cleanly() {
         "after release the run must get past the lock, got: {stderr}"
     );
 }
+
+#[test]
+fn put_does_not_hold_lock_while_waiting_on_stdin() {
+    // The reorder proof: spawn put with stdin piped but unwritten, so
+    // it blocks on the stdin read. After a settle delay (long past
+    // process startup, so an old-order put would already hold the
+    // lock), the journal lock must be acquirable while the child is
+    // still alive and waiting. If put held the lock first, every
+    // attempt here would fail.
+    use fs2::FileExt;
+    let dir = tmpdir("put-lock-order");
+    let kdbx = dir.join("test.kdbx");
+    let journal_path = dir.join("sync.db");
+    fixture_kdbx(&kdbx);
+    let lock_path = {
+        let mut p = journal_path.as_os_str().to_owned();
+        p.push(".lock");
+        std::path::PathBuf::from(p)
+    };
+    let mut child = Command::new(bin())
+        .args([
+            "put",
+            "--kdbx",
+            kdbx.to_str().unwrap(),
+            "--journal",
+            journal_path.to_str().unwrap(),
+            "--title",
+            "put-lock-test",
+            "--password-stdin",
+        ])
+        .env("KBS_MASTER_PASSWORD", "test-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Settle: startup is milliseconds; after this, an old-order put
+    // would already hold the lock while waiting on stdin.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let mut lock_free = false;
+    for _ in 0..25 {
+        // A dead child would free the lock trivially -- the proof
+        // requires the child to be alive when the lock proves free.
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        {
+            let f = std::fs::File::create(&lock_path).unwrap();
+            if f.try_lock_exclusive().is_ok() {
+                lock_free = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        lock_free,
+        "journal lock must be free while put waits on stdin"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "put must still be waiting on stdin when the lock proves free"
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"put-secret\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "put must succeed after stdin, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("created"),
+        "expected created output, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

@@ -194,6 +194,17 @@ impl Journal {
     }
 
     pub fn delete_mapping_by_kp(&self, kp_uuid: &Uuid) -> Result<()> {
+        // A missing row for a deleted mapping is stale by definition:
+        // the two-listing clock only means something while the pair is
+        // mapped. Clear it here, not by a later sweep, so first_seen
+        // never lingers for permanently deleted items. (The column
+        // stays -- dropping it would need a migration for zero benefit.)
+        // This delete runs first, while the mapping still names its
+        // bw_id; missing_bw rows are keyed by bw_id.
+        self.conn.execute(
+            "DELETE FROM missing_bw WHERE bw_id IN (SELECT bw_id FROM mapping WHERE kp_uuid = ?1)",
+            params![kp_uuid.to_string()],
+        )?;
         self.conn
             .execute("DELETE FROM mapping WHERE kp_uuid = ?1", params![kp_uuid.to_string()])?;
         Ok(())
@@ -608,6 +619,20 @@ mod tests {
     fn schema_version_stamped_on_open() {
         let j = test_journal();
         assert_eq!(j.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn delete_mapping_clears_its_missing_rows() {
+        let j = test_journal();
+        let u1 = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let u2 = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        j.upsert_mapping(&u1, "bw-1", "h1").unwrap();
+        j.upsert_mapping(&u2, "bw-2", "h2").unwrap();
+        j.note_missing("bw-1", &u1).unwrap();
+        j.note_missing("bw-2", &u2).unwrap();
+        j.delete_mapping_by_kp(&u1).unwrap();
+        assert!(!j.was_missing("bw-1").unwrap(), "deleted mapping's rows must go");
+        assert!(j.was_missing("bw-2").unwrap(), "live mapping's rows must stay");
     }
 
     #[test]

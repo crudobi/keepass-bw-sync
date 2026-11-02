@@ -145,10 +145,13 @@ pub struct BwItem {
     /// Organization collections this item belongs to, from the serve
     /// payload's `collectionIds`. A non-empty list means the item is
     /// org-owned: the engine never creates, edits, stamps, or trashes it
-    /// (see the `org-item` quarantine in `plan`). Parsed, not echoed:
-    /// engine PUTs are full replaces, so carrying no collections on an
-    /// org item would risk stripping its membership — quarantining
-    /// instead is what keeps that risk unreachable.
+    /// (see the `org-item` quarantine in `plan`). Parsed, and echoed on edit/stamp PUTs from the re-read item:
+    /// engine PUTs are full replaces, so omitting collections would
+    /// strip membership an item gained between plan and apply. The
+    /// plan-time gate quarantines org items, so an echo normally never
+    /// fires for one -- it exists for the item that gains membership
+    /// after the plan listing, and the next sync's gate then
+    /// quarantines it as the backstop.
     #[serde(
         rename = "collectionIds",
         default,
@@ -610,7 +613,7 @@ impl BwClient {
     /// `Zeroizing<String>` so the transient plaintext is wiped after use.
     ///
     /// `echo_src` is the current server-side item (present on edit): its
-    /// `type`, `reprompt`, and the URI `match` of the synced URL are echoed
+    /// `type`, `reprompt`, URI `match` of the synced URL, and `collectionIds` are echoed
     /// back, because the real serve applies `toView` replace semantics —
     /// omitting them would silently reset the URI match strategy and disable
     /// master-password reprompt. Creates have no source item (type 1, no
@@ -646,7 +649,7 @@ impl BwClient {
                 .and_then(|x| x.match_);
             uris.push(serde_json::json!({"uri": u, "match": m}));
         }
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": echo_src.map(|s| s.item_type).unwrap_or(1),
             "name": entry.title,
             "notes": entry.notes,
@@ -662,7 +665,20 @@ impl BwClient {
                 "totp": entry.totp,
                 "uris": uris,
             }
-        })
+        });
+        // Echo the source item's collections on edit: PUTs are full
+        // replaces, so omitting them would strip membership the item
+        // gained between plan and apply (the plan-time org gate only
+        // sees the plan-time listing). The next sync's gate then
+        // quarantines the item as org-item -- the echo is preservation,
+        // the gate is the backstop. Creates have no source item and
+        // never carry collections, so the key stays absent there.
+        if let Some(src) = echo_src {
+            if !src.collection_ids.is_empty() {
+                payload["collectionIds"] = serde_json::json!(src.collection_ids);
+            }
+        }
+        payload
     }
 
     pub fn create_item(
@@ -714,6 +730,10 @@ impl BwClient {
     /// the whole run and discarding every other action's journal commit.
     /// The PUT is a full replace with an identical payload, so a retried PUT
     /// after a 429 is a content no-op.
+    /// Note the remaining window: a concurrent Bitwarden edit between
+    /// this re-read and the PUT is still overwritten -- the serve API
+    /// offers no conditional writes, so the revision guard covers
+    /// plan-to-apply, not get-to-PUT.
     pub fn edit_item(
         &self,
         id: &str,
@@ -740,6 +760,9 @@ impl BwClient {
     /// Soft delete (moves to trash). With `expected_revision`, re-reads the
     /// item first and refuses to delete when it changed under us, returning
     /// [`TrashOutcome::RevisionChanged`] so the caller can quarantine instead.
+    /// Same get-to-PUT window as `edit_item`: a concurrent edit between
+    /// the re-read and the DELETE is not detected -- no conditional
+    /// writes exist in this API.
     pub fn trash_item(&self, id: &str, expected_revision: Option<&str>) -> Result<TrashOutcome> {
         if let Some(exp) = expected_revision {
             let cur = self.get_item(id)?;
@@ -778,7 +801,7 @@ impl BwClient {
     /// Stamp `KBS_SYNC_ID` / `KBS_SYNC_HASH` onto an existing item (adopt
     /// path: the item predates the engine). Skips when already stamped.
     /// Operates on a fresh read; the PUT carries the full item plus the two
-    /// stamp fields, echoing back `type`, `reprompt`, and URI `match` —
+    /// stamp fields, echoing back `type`, `reprompt`, URI `match`, and `collectionIds` —
     /// the real serve applies `toView` replace semantics, so omitting them
     /// would silently reset them. Content hashes exclude the stamps, so the
     /// journal hash recorded at adopt time stays valid.
@@ -805,7 +828,7 @@ impl BwClient {
             .iter()
             .map(|u| serde_json::json!({"uri": u.uri, "match": u.match_}))
             .collect();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": it.item_type,
             "name": it.name,
             "notes": it.notes,
@@ -820,6 +843,14 @@ impl BwClient {
                 "uris": uris,
             },
         });
+        // Echo collections like item_payload does: a stamp PUT is a
+        // full replace too, and dropping membership here would strip
+        // it just as surely. (Adopt normally never reaches an org
+        // item -- the plan gate quarantines those first -- but the echo
+        // keeps the PUT safe if one ever does.)
+        if !it.collection_ids.is_empty() {
+            payload["collectionIds"] = serde_json::json!(it.collection_ids);
+        }
         let (status, bytes) =
             self.exchange_retry(&format!("PUT stamp item {id}"), "parse PUT stamp item", || {
                 self.http
@@ -1117,6 +1148,61 @@ pub(crate) mod tests {
         assert_eq!(uris[0]["match"], 3);
         assert_eq!(uris[1]["uri"], "https://b.example.com");
         assert!(uris[1]["match"].is_null());
+    }
+
+    #[test]
+    fn item_payload_echoes_collection_ids_on_edit_only() {
+        // The plan-to-apply org race: an item personal at plan that
+        // gains membership before apply must not have it stripped by
+        // the full-replace PUT. Creates have no source item, so the
+        // key stays absent there.
+        let src: BwItem = serde_json::from_value(serde_json::json!({
+            "id": "bw-1", "name": "t", "notes": null, "favorite": false,
+            "folderId": null, "type": 1, "reprompt": null,
+            "login": {
+                "username": "u", "password": "p", "totp": null, "uris": []
+            },
+            "fields": [],
+            "collectionIds": ["coll-1", "coll-2"],
+            "revisionDate": "r1", "deletedDate": null
+        }))
+        .unwrap();
+        let entry = entry();
+        let payload = BwClient::item_payload(&entry, None, "hashhex", Some(&src));
+        assert_eq!(payload["collectionIds"], serde_json::json!(["coll-1", "coll-2"]));
+        let payload = BwClient::item_payload(&entry, None, "hashhex", None);
+        assert!(
+            payload.get("collectionIds").is_none(),
+            "creates must not carry a collections key, got: {payload}"
+        );
+    }
+
+    #[test]
+    fn stamp_item_echoes_collection_ids() {
+        let item = serde_json::json!({
+            "success": true,
+            "data": {
+                "id": "bw-1", "name": "t", "notes": "n", "favorite": false,
+                "folderId": null, "type": 1, "reprompt": null,
+                "login": {
+                    "username": "u", "password": "p", "totp": null, "uris": []
+                },
+                "fields": [],
+                "collectionIds": ["coll-9"],
+                "revisionDate": "r1", "deletedDate": null
+            }
+        })
+        .to_string();
+        let (base, captured) = stub_server_capturing(vec![
+            ("GET /object/item/bw-1 ".into(), 200, item.clone()),
+            ("PUT /object/item/bw-1 ".into(), 200, r#"{"success":true}"#.into()),
+        ]);
+        let bw = BwClient::new(&base).unwrap();
+        bw.stamp_item("bw-1", &uuid::Uuid::nil(), "deadbeef").unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let put = serde_json::from_slice::<serde_json::Value>(&captured[1].1).unwrap();
+        assert_eq!(put["collectionIds"], serde_json::json!(["coll-9"]));
     }
 
     #[test]
