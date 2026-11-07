@@ -5,7 +5,8 @@
 //!
 //! Fails closed when KBS_MASTER_PASSWORD is unset or empty; the password is
 //! zeroized after use. Documented as a one-off: the production password lives
-//! in $SECRETS_DIR/vault.env (0600, never printed, never committed).
+//! sealed in $SECRETS_DIR/vault.env.cred (TPM2; see README "TPM sealing"),
+//! never printed, never committed.
 
 #[cfg(not(unix))]
 use std::fs::File;

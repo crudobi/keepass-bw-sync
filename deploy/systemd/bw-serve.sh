@@ -6,7 +6,9 @@ set -euo pipefail
 # Credentials come from the environment (see bw-serve.service's EDIT markers).
 # ----------------------------------------------------------------------------
 # Supervised `bw serve` for keepass-bw-sync.
-# Credentials come from EnvironmentFile=/store/muscle/secrets/bw.env (0600):
+# Credentials come from the environment: the unit supplies them from the
+# TPM-sealed bw.env credential via kbs-tpm-wrapper.py (see bw-serve.service).
+# The decrypted file defines:
 #   BW_PASSWORD                    master password (vault unlock/decrypt)
 #   BW_CLIENTID / BW_CLIENTSECRET  API key for headless (re-)login
 # Fails closed when BW_PASSWORD is unset. (Re-)login uses the API key, the

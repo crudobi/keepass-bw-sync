@@ -2,12 +2,15 @@
 # EDIT FOR YOUR MACHINE -- this unit ships with the author's values.
 # Change these before enabling:
 #   User=crudobi                                    -> your Linux username
-#   EnvironmentFile=/store/muscle/secrets/vault.env -> path to YOUR env file
-#                                                     (0600) with KBS_MASTER_PASSWORD
+#   LoadCredentialEncrypted=vault.env:...           -> TPM-sealed env file,
+#     /store/muscle/secrets/vault.env.cred           see README "TPM sealing";
+#                                                     the plaintext env file
+#                                                     must NOT stay on disk
 #   ExecStart=... --kdbx /store/muscle/secrets/vault.kdbx
 #                    --journal /store/muscle/secrets/sync.db
 #                                                   -> YOUR vault and journal paths
 #   /usr/local/bin/keepass-bw-sync                  -> path where you installed the binary
+#   /usr/local/bin/kbs-tpm-wrapper.py               -> copy of deploy/systemd/kbs-tpm-wrapper.py
 # See README.md "Deployment example" for the full setup.
 # ============================================================================
 [Unit]
@@ -18,8 +21,8 @@ After=bw-serve.service
 [Service]
 Type=oneshot
 User=crudobi
-EnvironmentFile=/store/muscle/secrets/vault.env
-ExecStart=/usr/local/bin/keepass-bw-sync sync --kdbx /store/muscle/secrets/vault.kdbx --journal /store/muscle/secrets/sync.db
+LoadCredentialEncrypted=vault.env:/store/muscle/secrets/vault.env.cred
+ExecStart=/usr/local/bin/kbs-tpm-wrapper.py vault.env /usr/local/bin/keepass-bw-sync sync --kdbx /store/muscle/secrets/vault.kdbx --journal /store/muscle/secrets/sync.db
 # Default safe flags: no --force, --adopt, or --writeback.
 # Foreign Bitwarden edits quarantine for human review.
 

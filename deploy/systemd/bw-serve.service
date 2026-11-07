@@ -2,10 +2,14 @@
 # EDIT FOR YOUR MACHINE -- this unit ships with the author's values.
 # Change these before enabling:
 #   User=crudobi                                  -> your Linux username
-#   EnvironmentFile=-/store/muscle/secrets/bw.env -> path to YOUR env file
+#   LoadCredentialEncrypted=bw.env:...            -> TPM-sealed env file,
+#     /store/muscle/secrets/bw.env.cred            see README "TPM sealing";
+#                                                   the plaintext env file
+#                                                   must NOT stay on disk
 #                                                   (0600) with BW_PASSWORD and/or
 #                                                   BW_CLIENTID / BW_CLIENTSECRET
 #   ExecStart=/usr/local/bin/bw-serve.sh          -> path where you installed bw-serve.sh
+#   /usr/local/bin/kbs-tpm-wrapper.py             -> copy of deploy/systemd/kbs-tpm-wrapper.py
 # See README.md "Deployment example" for the full setup.
 # ============================================================================
 [Unit]
@@ -16,10 +20,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=crudobi
-# Optional until the Bitwarden account is hardened (see README):
-# /store/muscle/secrets/bw.env must define BW_PASSWORD (0600).
-EnvironmentFile=-/store/muscle/secrets/bw.env
-ExecStart=/usr/local/bin/bw-serve.sh
+# The sealed credential must decrypt to an env file defining BW_PASSWORD
+# (0600 plaintext before sealing; see README "TPM sealing"). The unit
+# fails closed when the blob is missing or unsealable.
+LoadCredentialEncrypted=bw.env:/store/muscle/secrets/bw.env.cred
+ExecStart=/usr/local/bin/kbs-tpm-wrapper.py bw.env /usr/local/bin/bw-serve.sh
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

@@ -349,9 +349,12 @@ run.
 ### Files
 
 - `$SECRETS_DIR/vault.kdbx` — the vault (0600)
-- `$SECRETS_DIR/vault.env` — `KBS_MASTER_PASSWORD=<redacted>
+- `$SECRETS_DIR/vault.env.cred` — `KBS_MASTER_PASSWORD`, sealed with
+  `systemd-creds` (TPM2, 0600). The plaintext `vault.env` exists only
+  transiently while sealing — see "TPM sealing" — and must not stay on disk.
 - `$SECRETS_DIR/sync.db` — sync journal (created on first sync)
-- `$SECRETS_DIR/bw.env` — `BW_PASSWORD=<redacted>
+- `$SECRETS_DIR/bw.env.cred` — `BW_PASSWORD` (and/or `BW_CLIENTID` /
+  `BW_CLIENTSECRET`), sealed the same way.
 
 (The author's machine uses `/store/muscle/secrets` for `$SECRETS_DIR`.)
 
@@ -361,23 +364,92 @@ run.
 `/etc/systemd/system/` and `/usr/local/bin/` (`systemd-analyze verify`
 clean), then work through the `# EDIT:` markers at the top of each file for
 your username and paths. Leave them disabled until the Bitwarden account is
-hardened (see checklist).
+hardened (see checklist). Also copy `deploy/systemd/kbs-tpm-wrapper.py`
+to `/usr/local/bin/` and `chmod 0755` it — both units exec through it
+(see "TPM sealing").
 
 - `bw-serve.service` — supervised `bw serve` via `bw-serve.sh`
-  (`Restart=always`; fails closed when `BW_PASSWORD` is unset; the
-  `EnvironmentFile=-...` is optional until the account is hardened).
+  (`Restart=always`; fails closed when the sealed `bw.env` credential is
+  missing or unsealable, and when `BW_PASSWORD` is unset).
 - `kbs-sync.service` — oneshot sync with default safe flags
   (no `--force` / `--adopt` / `--writeback`; foreign Bitwarden edits
   quarantine for human review). `Requires=bw-serve.service`.
 - `kbs-sync.timer` — hourly, `Persistent=true`, `RandomizedDelaySec=600`.
 
+### TPM sealing
+
+On a machine with TPM2, the master passwords never live on disk as
+plaintext. Create each env file once (0600), seal it, then delete the
+plaintext:
+
+```sh
+# vault.env holds KBS_MASTER_PASSWORD=<password>; bw.env holds
+# BW_PASSWORD=<password> (and/or BW_CLIENTID / BW_CLIENTSECRET).
+# Type the values at a prompt rather than sourcing a password file.
+sudo systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs=0+7 \
+  --name=vault.env "$SECRETS_DIR/vault.env" "$SECRETS_DIR/vault.env.cred"
+sudo systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs=0+7 \
+  --name=bw.env "$SECRETS_DIR/bw.env" "$SECRETS_DIR/bw.env.cred"
+sudo chmod 0600 "$SECRETS_DIR/vault.env.cred" "$SECRETS_DIR/bw.env.cred"
+rm "$SECRETS_DIR/vault.env" "$SECRETS_DIR/bw.env"
+```
+
+Details that matter:
+
+- `--with-key=tpm2` seals to the TPM only (not `auto`, which would also
+  require the host key — an extra on-disk dependency with no gain against
+  disk theft). `--tpm2-pcrs=0+7` binds the seal to firmware (PCR 0) and
+  Secure Boot policy (PCR 7); no PIN, so unattended sync keeps working.
+  On a box with Secure Boot disabled the PCR 7 half is weak and PCR 0
+  does the real work.
+- **The credential name is bound.** `systemd-creds` embeds a name in the
+  blob, and PID1 refuses a credential whose embedded name differs from
+  the name declared in `LoadCredentialEncrypted=` (exit 243). The name
+  comes from `--name=` — it must be `vault.env` / `bw.env`, matching the
+  unit files; the blob filename alone does not set it. `decrypt` needs
+  `--name=` too when the file name differs.
+- **Why the wrapper exists.** `EnvironmentFile=` cannot consume a
+  credential: PID1 reads env files before the per-service credentials
+  directory is set up, so both `%d` and the literal
+  `/run/credentials/<unit>/<name>` fail with "Failed to load environment
+  files" (systemd 257, verified). The sanctioned pattern is for the
+  process itself to read `$CREDENTIALS_DIRECTORY/<name>` at runtime —
+  that is what `kbs-tpm-wrapper.py` (Python stdlib only) does: it parses
+  the decrypted file as env-file syntax, exports the variables, and
+  execs the command. It never prints values.
+- **What sealing does and does not do.** It protects the disk: a stolen
+  disk, a backup copy, or any process that can read the files gets
+  ciphertext that only this machine's TPM can open. It does NOT protect
+  against live root on the running machine — the password still has to
+  be in RAM while the tool decrypts the vault, and nothing can change
+  that.
+- **Rotation.** A firmware update (PCR 0) or Secure Boot policy change
+  (PCR 7) breaks unseal: `bw-serve` enters a restart loop and syncs
+  fail. Re-encrypt with the same commands above — from the
+  human-supplied password, since the old blob can no longer be opened —
+  then restart the services. TPM or board death breaks automation the
+  same way; the vault itself is unaffected.
+- **Break-glass is the human passwords.** Once the plaintext files are
+  deleted, the only way back is the passwords you know (plus the sealed
+  blobs while the PCRs hold). Do not delete the plaintext until both
+  services have been verified running on the sealed blobs.
+
+Machines without TPM2 use the plaintext-env fallback instead: keep
+`vault.env` / `bw.env` (0600 in a 0700 directory) and put
+`EnvironmentFile=` back in the units in place of
+`LoadCredentialEncrypted=` + the wrapper. That is strictly less secure —
+anyone who can read the disk can read the passwords — so prefer sealing
+whenever the hardware allows it.
+
 ### Account-hardening checklist (unblocks enabling the timer)
 
 1. Rotate the Bitwarden master password if it was ever exposed.
 2. Enable 2FA on the Bitwarden account.
-3. Create `$SECRETS_DIR/bw.env` (0600) with `BW_PASSWORD=...`
-   (or `BW_CLIENTID` / `BW_CLIENTSECRET` for API-key login, which bypasses
-   2FA for headless use).
+3. Seal both env files (see "TPM sealing"): create `vault.env` (0600)
+   with `KBS_MASTER_PASSWORD=...` and `bw.env` (0600) with
+   `BW_PASSWORD=...` (or `BW_CLIENTID` / `BW_CLIENTSECRET` for API-key
+   login, which bypasses 2FA for headless use), encrypt both with
+   `systemd-creds`, then delete the plaintext files.
 4. `sudo systemctl enable --now bw-serve.service kbs-sync.timer`
 5. Migrate secrets into the vault one by one, verifying each with
    `keepass-bw-sync get`.
