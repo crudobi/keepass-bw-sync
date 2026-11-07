@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **TPM sealing: the master passwords no longer live on disk as plaintext.**
+  `vault.env` and `bw.env` are now `systemd-creds` sealed blobs
+  (`vault.env.cred` / `bw.env.cred`, TPM2-only key, PCR 0+7, no PIN),
+  loaded with `LoadCredentialEncrypted=` and handed to the services by a
+  small Python wrapper (`deploy/systemd/kbs-tpm-wrapper.py`) that parses
+  the decrypted env file and execs the command. The wrapper exists
+  because `EnvironmentFile=` cannot consume a credential: PID1 reads env
+  files before the per-service credentials directory is set up, so both
+  `%d` and the literal `/run/credentials/<unit>/<name>` fail on systemd
+  257 (verified). Credential names are bound — the name embedded at
+  encrypt time (`--name=vault.env`) must match the declared name, or
+  PID1 refuses with exit 243. Rotation: a firmware update (PCR 0) or
+  Secure Boot policy change (PCR 7) breaks unseal until re-encryption
+  from the human-supplied password; the human passwords are the only
+  break-glass now. Sealing protects the disk, not a live root compromise.
+  The plaintext-env path stays documented as the non-TPM fallback only.
+  Live-verified 2026-11-06 on the author's machine: dry-run and live
+  syncs plan 0 actions (25↔25) through the sealed credential, `bw
+  unlock` exits 0 through the sealed `bw.env`, both services restarted
+  clean after the plaintext files were deleted.
+
 - **Restore now honors the sync gates, and delete propagation no longer
   undoes a user's restore.** `restore` skips org-owned items (counted
   as `skipped_org`) and counts entries restored without their blobs
