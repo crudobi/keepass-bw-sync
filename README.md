@@ -52,20 +52,25 @@ everything ever encrypted under it. What this engine does instead:
   loopback (`Restart=always`) — the daemon form of this tool is NOT
   short-lived unlock → sync → wipe. Its confinement is the loopback-only
   bind, `User=crudobi`, `NoNewPrivileges`, and `PrivateTmp` — but `bw
-  serve` has NO peer authentication on loopback TCP, so any local UID
-  can dump, create, edit, and trash vault items through the API today.
-  Those mitigations confine the daemon process, not its API peers.
-  Low severity on a true single-user box; on a multi-user box this
-  needs a real boundary (Unix socket, nftables owner-match, or an auth
-  proxy), which is not implemented yet (see Known limitations).
+  serve` has NO peer authentication on loopback TCP, so without a
+  further boundary any local UID could dump, create, edit, and trash
+  vault items through the API. Those mitigations confine the daemon
+  process, not its API peers. Low severity on a true single-user box;
+  on a multi-user box this needs a real boundary. The author's
+  deployment has one: ufw `before.rules` ACCEPTs loopback TCP to port
+  8087 only for uid 0 and uid 1001, then DROPs every other local UID
+  (probed: an unprivileged UID times out). The shipped units do NOT
+  include those rules — a multi-user install must add its own boundary
+  (ufw owner-match, Unix socket, nftables owner-match, or auth proxy).
   Manual runs are short-lived by contrast, and `BW_SESSION` is never
   persisted by this tool.
 
 Known limitations: `reqwest`/`serde_json` make their own in-RAM copies of
 request bodies that we cannot zeroize; the `bw serve` leg is plaintext HTTP
-on loopback with no peer authentication (fine on a true single-user
-box; any local UID can use it — sealing it needs a Unix socket,
-nftables owner-match, or an auth proxy, none implemented yet).
+on loopback with no peer authentication in the daemon itself — the
+author's deployment seals it with ufw owner-match rules (loopback TCP
+to port 8087 only for uid 0 and uid 1001), but the shipped units do
+not include them, so a multi-user install must add its own boundary.
 
 ## How it works
 
