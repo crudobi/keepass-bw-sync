@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **README: the daemon peer boundary is no longer "not implemented yet".**
+  The threat model and Known limitations now state the live shape: `bw
+  serve` itself still has no peer authentication, but the author's
+  deployment enforces the boundary with ufw owner-match rules (loopback
+  TCP to port 8087 only for uid 0 and uid 1001, other local UIDs
+  dropped; probed 2026-11-02). The shipped units still do not include
+  those rules — a multi-user install must add its own boundary.
+
 - **TPM sealing: the master passwords no longer live on disk as plaintext.**
   `vault.env` and `bw.env` are now `systemd-creds` sealed blobs
   (`vault.env.cred` / `bw.env.cred`, TPM2-only key, PCR 0+7, no PIN),
